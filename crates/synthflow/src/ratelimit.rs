@@ -1,123 +1,131 @@
-//! Sliding-window admission control for provider rate limits.
-//!
-//! Reservations are recorded optimistically at their admission instant, so
-//! concurrent callers can never push a window over its budget. A cancelled
-//! caller merely wastes its own reservation.
-
-use std::time::Duration;
+//! Joint RPM/TPM admission at the actual send boundary. Waiting callers do
+//! not reserve future slots; each rechecks both budgets before sending.
+use crate::{Error, Result};
+use std::{collections::VecDeque, sync::Mutex, time::Duration};
 use tokio::time::Instant;
 
-pub(crate) const WINDOW: Duration = Duration::from_secs(60);
-
-pub(crate) struct SlidingWindow {
-    window: Duration,
-    max: i64,
-    events: std::sync::Mutex<Vec<(Instant, i64)>>,
+const WINDOW: Duration = Duration::from_secs(60);
+struct Event {
+    id: u64,
+    at: Instant,
+    tokens: u64,
 }
-
-impl SlidingWindow {
-    pub(crate) fn new(max: u64) -> Self {
-        Self::with_window(max, WINDOW)
-    }
-
-    pub(crate) fn with_window(max: u64, window: Duration) -> Self {
+#[derive(Default)]
+struct State {
+    next_id: u64,
+    events: VecDeque<Event>,
+}
+pub(crate) struct RateLimiter {
+    rpm: Option<u32>,
+    tpm: Option<u32>,
+    state: Mutex<State>,
+}
+pub(crate) enum Admission {
+    Send(u64),
+    Wait(Instant),
+}
+impl RateLimiter {
+    pub(crate) fn new(rpm: Option<u32>, tpm: Option<u32>) -> Self {
         Self {
-            window,
-            max: max as i64,
-            events: std::sync::Mutex::new(Vec::new()),
+            rpm,
+            tpm,
+            state: Mutex::new(State::default()),
         }
     }
-
-    /// Reserve `cost` units and return the admission instant. It equals now
-    /// when the budget allows, otherwise the earliest expiry instant of
-    /// earlier events that frees enough budget.
-    pub(crate) fn reserve(&self, cost: i64) -> Instant {
-        let now = Instant::now();
-        let mut events = self.events.lock().expect("rate limit lock");
-        events.retain(|(ts, _)| *ts + self.window > now);
-        let mut suffix = vec![0i64; events.len() + 1];
-        for i in (0..events.len()).rev() {
-            suffix[i] = suffix[i + 1] + events[i].1;
+    pub(crate) fn admit(&self, tokens: u64) -> Result<Admission> {
+        if self.rpm == Some(0) || self.tpm == Some(0) {
+            return Err(Error::Configuration("rate limits must be positive".into()));
         }
-        let admission = if suffix[0] + cost <= self.max {
-            now
-        } else {
-            // Candidates are the instants at which existing events expire.
-            // At events[k]'s expiry everything sharing its timestamp is gone.
-            let mut chosen = events
-                .last()
-                .map(|(ts, _)| *ts + self.window)
-                .unwrap_or(now);
-            let mut k = 0;
-            while k < events.len() {
-                let expiry = events[k].0 + self.window;
-                let mut j = k;
-                while j < events.len() && events[j].0 + self.window == expiry {
-                    j += 1;
-                }
-                if suffix[j] + cost <= self.max {
-                    chosen = expiry;
-                    break;
-                }
-                k = j;
+        if self.tpm.is_some_and(|max| tokens > u64::from(max)) {
+            return Err(Error::Configuration(
+                "estimated request tokens exceed tokens_per_minute".into(),
+            ));
+        }
+        let now = Instant::now();
+        let mut state = self.state.lock().expect("rate limit lock");
+        while state
+            .events
+            .front()
+            .is_some_and(|event| event.at + WINDOW <= now)
+        {
+            state.events.pop_front();
+        }
+        let used: u128 = state.events.iter().map(|e| u128::from(e.tokens)).sum();
+        let full = self
+            .rpm
+            .is_some_and(|max| state.events.len() >= max as usize)
+            || self
+                .tpm
+                .is_some_and(|max| used + u128::from(tokens) > u128::from(max));
+        if full {
+            return Ok(Admission::Wait(
+                state.events.front().expect("occupied budget").at + WINDOW,
+            ));
+        }
+        let id = state.next_id;
+        state.next_id += 1;
+        if self.rpm.is_some() || self.tpm.is_some() {
+            state.events.push_back(Event {
+                id,
+                at: now,
+                tokens,
+            });
+        }
+        Ok(Admission::Send(id))
+    }
+    /// Correct the original event, keeping its original expiry. No negative
+    /// credit can survive after the associated request leaves the window.
+    pub(crate) fn correct(&self, id: u64, actual: u64) {
+        if self.tpm.is_some() {
+            let mut state = self.state.lock().expect("rate limit lock");
+            if let Some(event) = state.events.iter_mut().find(|event| event.id == id) {
+                event.tokens = actual;
             }
-            chosen
-        };
-        let at = admission.max(now);
-        let position = events.partition_point(|(ts, _)| *ts <= at);
-        events.insert(position, (at, cost));
-        at
-    }
-
-    /// Account a retroactive correction, typically actual usage replacing a
-    /// token estimate. Negative deltas free budget immediately.
-    pub(crate) fn adjust(&self, delta: i64) {
-        let now = Instant::now();
-        let mut events = self.events.lock().expect("rate limit lock");
-        let position = events.partition_point(|(ts, _)| *ts <= now);
-        events.insert(position, (now, delta));
+        }
     }
 }
-
-/// Rough pre-flight token estimate; corrected from real usage after the call.
-pub(crate) fn estimate_tokens(prompt: &str) -> i64 {
-    prompt.chars().count() as i64 / 4 + 32
+pub(crate) fn estimate_tokens(prompt: &str) -> u64 {
+    prompt.chars().count() as u64 / 4 + 32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test(start_paused = true)]
-    async fn reservations_spread_evenly_across_the_window() {
-        let limiter = SlidingWindow::with_window(2, WINDOW);
-        let t0 = Instant::now();
-        assert_eq!(limiter.reserve(1), t0);
-        assert_eq!(limiter.reserve(1), t0);
-        assert_eq!(limiter.reserve(1), t0 + WINDOW);
-        assert_eq!(limiter.reserve(1), t0 + WINDOW);
-        assert_eq!(limiter.reserve(1), t0 + WINDOW * 2);
+    fn sent(value: Result<Admission>) -> u64 {
+        match value.expect("admission") {
+            Admission::Send(id) => id,
+            Admission::Wait(_) => panic!("unexpected wait"),
+        }
     }
-
     #[tokio::test(start_paused = true)]
-    async fn a_single_large_cost_blocks_until_full_expiry() {
-        let limiter = SlidingWindow::with_window(10, WINDOW);
-        let t0 = Instant::now();
-        assert_eq!(limiter.reserve(10), t0);
-        assert_eq!(limiter.reserve(1), t0 + WINDOW);
+    async fn both_budgets_apply_at_send_time() {
+        let limiter = RateLimiter::new(Some(2), Some(100));
+        sent(limiter.admit(100));
+        assert!(matches!(limiter.admit(100).unwrap(), Admission::Wait(_)));
+        tokio::time::advance(WINDOW).await;
+        sent(limiter.admit(100));
+        tokio::time::advance(WINDOW).await;
+        sent(limiter.admit(32));
+        sent(limiter.admit(32));
+        assert!(matches!(limiter.admit(32).unwrap(), Admission::Wait(_)));
     }
-
     #[tokio::test(start_paused = true)]
-    async fn negative_adjustments_release_budget_immediately() {
-        let limiter = SlidingWindow::with_window(2, WINDOW);
-        let t0 = Instant::now();
-        assert_eq!(limiter.reserve(1), t0);
-        assert_eq!(limiter.reserve(1), t0);
-        limiter.adjust(-1);
-        assert_eq!(limiter.reserve(1), t0);
-        assert_eq!(limiter.reserve(1), t0 + WINDOW);
+    async fn corrections_expire_with_the_original_request() {
+        let limiter = RateLimiter::new(None, Some(100));
+        let id = sent(limiter.admit(100));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        limiter.correct(id, 10);
+        sent(limiter.admit(90));
+        tokio::time::advance(Duration::from_secs(50)).await;
+        sent(limiter.admit(10));
+        assert!(matches!(limiter.admit(1).unwrap(), Admission::Wait(_)));
     }
-
+    #[tokio::test]
+    async fn oversized_request_is_rejected_without_consuming_budget() {
+        let limiter = RateLimiter::new(Some(1), Some(10));
+        assert!(limiter.admit(11).is_err());
+        sent(limiter.admit(10));
+    }
     #[test]
     fn token_estimate_scales_with_prompt_length() {
         assert_eq!(estimate_tokens(""), 32);

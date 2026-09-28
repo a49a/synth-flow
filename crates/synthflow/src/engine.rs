@@ -372,7 +372,7 @@ async fn execute(
     let mut env = template::environment();
     env.add_template("generate", &pipeline.generate.prompt)
         .map_err(|_| Error::Configuration("invalid generation template".into()))?;
-    let judge = build_judge(pipeline)?;
+    let judge = build_judge(pipeline, provider.clone())?;
     let source_hash = source_fingerprint(pipeline, &cancellation).await?;
     let mut source = Source::open(&pipeline.source)?;
     let (mut artifacts, mut report, skip_through, mut dedup) = match resume {
@@ -665,13 +665,17 @@ struct JudgeTools {
     min_score: f64,
 }
 
-fn build_judge(pipeline: &Pipeline) -> Result<Option<JudgeTools>> {
+fn build_judge(pipeline: &Pipeline, generator: Arc<dyn LlmProvider>) -> Result<Option<JudgeTools>> {
     let Some(config) = &pipeline.judge else {
         return Ok(None);
     };
-    let provider = create_provider(pipeline.providers.get(&config.provider).ok_or_else(|| {
-        Error::Configuration("judge.provider references an unknown provider".into())
-    })?)?;
+    let provider = if config.provider == pipeline.generate.provider {
+        generator
+    } else {
+        create_provider(pipeline.providers.get(&config.provider).ok_or_else(|| {
+            Error::Configuration("judge.provider references an unknown provider".into())
+        })?)?
+    };
     if !(1..=1024).contains(&provider.concurrency()) {
         return Err(Error::Configuration(
             "judge provider concurrency must be in 1..=1024".into(),

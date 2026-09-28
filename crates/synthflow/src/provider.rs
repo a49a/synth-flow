@@ -1,7 +1,7 @@
 use crate::{
     Error, Result,
     error::ProviderErrorKind,
-    ratelimit::{SlidingWindow, estimate_tokens},
+    ratelimit::{Admission, RateLimiter, estimate_tokens},
     spec::{MAX_RECORD_BYTES, ProviderConfig, RateLimitConfig, RetryPolicy},
     template,
 };
@@ -143,8 +143,7 @@ pub struct OpenAiProvider {
     concurrency: usize,
     timeout: Duration,
     retry: RetryPolicy,
-    rpm: Option<SlidingWindow>,
-    tpm: Option<SlidingWindow>,
+    limiter: RateLimiter,
     metrics: Metrics,
 }
 impl OpenAiProvider {
@@ -205,8 +204,7 @@ impl OpenAiProvider {
             concurrency: *concurrency,
             timeout: Duration::from_millis(*timeout_ms),
             retry: retry.clone(),
-            rpm: requests_per_minute.map(|v| SlidingWindow::new(v as u64)),
-            tpm: tokens_per_minute.map(|v| SlidingWindow::new(v as u64)),
+            limiter: RateLimiter::new(requests_per_minute, tokens_per_minute),
             metrics: Metrics::default(),
         })
     }
@@ -336,31 +334,19 @@ impl LlmProvider for OpenAiProvider {
             result = async {
                 let token_estimate = estimate_tokens(request.prompt);
                 for attempt in 1..=self.retry.max_attempts {
-                    // Every physical request, retries included, passes the
-                    // rate limit before it touches the semaphore or the wire;
-                    // a cancelled or failed attempt only wastes its own
-                    // reservation, never the window budget.
-                    let admission = [
-                        self.rpm.as_ref().map(|limiter| limiter.reserve(1)),
-                        self.tpm
-                            .as_ref()
-                            .map(|limiter| limiter.reserve(token_estimate)),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .max();
-                    if let Some(until) = admission {
-                        let now = tokio::time::Instant::now();
-                        if until > now {
-                            tracing::debug!(
-                                attempt,
-                                wait_ms = (until - now).as_millis() as u64,
-                                event = "rate_limit_wait"
-                            );
-                            tokio::time::sleep_until(until).await;
+                    // Obtain capacity before admitting a physical send. If a
+                    // quota is full, release capacity and recheck both budgets
+                    // after sleeping; no future reservation can expire early.
+                    let (permit, admission_id) = loop {
+                        let permit = self.permits.acquire().await.map_err(|_| Error::Cancelled)?;
+                        match self.limiter.admit(token_estimate)? {
+                            Admission::Send(id) => break (permit, id),
+                            Admission::Wait(until) => {
+                                drop(permit);
+                                tokio::time::sleep_until(until).await;
+                            }
                         }
-                    }
-                    let permit = self.permits.acquire().await.map_err(|_| Error::Cancelled)?;
+                    };
                     self.metrics.requests.fetch_add(1, Ordering::Relaxed);
                     if attempt > 1 { self.metrics.retries.fetch_add(1, Ordering::Relaxed); }
                     let started = Instant::now();
@@ -369,12 +355,10 @@ impl LlmProvider for OpenAiProvider {
                     drop(permit); // Never hold provider capacity during backoff.
                     match result {
                         Ok(response) => {
-                            // Replace the token estimate with reported usage.
-                            if let Some(tpm) = &self.tpm
-                                && let (Some(prompt), Some(completion)) =
-                                    (response.prompt_tokens, response.completion_tokens)
+                            if let (Some(prompt), Some(completion)) =
+                                (response.prompt_tokens, response.completion_tokens)
                             {
-                                tpm.adjust((prompt + completion) as i64 - token_estimate);
+                                self.limiter.correct(admission_id, prompt.saturating_add(completion));
                             }
                             return Ok(response);
                         }
