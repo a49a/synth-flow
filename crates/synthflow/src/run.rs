@@ -35,6 +35,15 @@ pub struct SinkState {
     pub rejected_bytes: u64,
 }
 
+/// Provenance of a resumed run: which interrupted run produced the
+/// committed prefix this run continues.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumedFrom {
+    pub run_id: String,
+    pub accepted_records: u64,
+    pub rejected_records: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunReport {
     pub run_id: String,
@@ -51,6 +60,13 @@ pub struct RunReport {
     pub provider: String,
     pub model: String,
     pub sink_state: SinkState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<ResumedFrom>,
+    // Counts carried over from the run being resumed; fresh runs keep zero.
+    #[serde(skip)]
+    pub base_accepted_records: u64,
+    #[serde(skip)]
+    pub base_rejected_records: u64,
     #[serde(flatten)]
     pub statistics: RunStatistics,
     pub errors: Vec<Diagnostic>,
@@ -243,6 +259,9 @@ impl Artifacts {
             provider: pipeline.generate.provider.clone(),
             model,
             sink_state: SinkState::default(),
+            resumed_from: None,
+            base_accepted_records: 0,
+            base_rejected_records: 0,
             statistics: RunStatistics::default(),
             errors: Vec::new(),
         };
@@ -259,6 +278,74 @@ impl Artifacts {
             .map_err(|e| Error::io(&report.dead_letter_path, e))?;
         sync_parent(&report.partial_path)?;
         sync_parent(&report.dead_letter_path)?;
+        save_report(&report)?;
+        Ok((this, report))
+    }
+
+    /// Continue a failed or cancelled run: truncate both files to the
+    /// committed prefix, reopen them for appends, and start a fresh report
+    /// that carries the prior committed state and provenance.
+    pub fn resume(
+        pipeline: &Pipeline,
+        fingerprint: String,
+        prior: &RunReport,
+    ) -> Result<(Self, RunReport)> {
+        let output = normalize_path(&pipeline.output.path)?;
+        let partial = suffix(&output, ".partial");
+        let manifest = suffix(&output, ".manifest.json");
+        let dead = pipeline.dead_letter_path()?;
+        if prior.partial_path != partial
+            || prior.manifest_path != manifest
+            || prior.dead_letter_path != dead
+        {
+            return Err(Error::Configuration(
+                "artifact paths changed since the recorded run".into(),
+            ));
+        }
+        if output.try_exists().map_err(|e| Error::io(&output, e))? {
+            return Err(Error::Configuration(
+                "final output already exists; nothing to resume".into(),
+            ));
+        }
+        let accepted = open_append_truncated(&partial, prior.sink_state.accepted_bytes)?;
+        let rejected = open_append_truncated(&dead, prior.sink_state.rejected_bytes)?;
+        let model = match pipeline.providers.get(&pipeline.generate.provider) {
+            Some(crate::spec::ProviderConfig::OpenaiCompatible { model, .. }) => model.clone(),
+            _ => "synthflow-mock-v1".into(),
+        };
+        let report = RunReport {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            status: RunStatus::Running,
+            pipeline_version: pipeline.version,
+            pipeline_hash: pipeline.hash()?,
+            source_fingerprint: fingerprint,
+            started_at_unix_ms: now_ms(),
+            finished_at_unix_ms: None,
+            output_path: output,
+            partial_path: partial,
+            dead_letter_path: dead,
+            manifest_path: manifest,
+            provider: pipeline.generate.provider.clone(),
+            model,
+            sink_state: prior.sink_state.clone(),
+            resumed_from: Some(ResumedFrom {
+                run_id: prior.run_id.clone(),
+                accepted_records: prior.sink_state.committed_accepted_records,
+                rejected_records: prior.sink_state.committed_rejected_records,
+            }),
+            base_accepted_records: prior.sink_state.committed_accepted_records,
+            base_rejected_records: prior.sink_state.committed_rejected_records,
+            statistics: RunStatistics::default(),
+            errors: Vec::new(),
+        };
+        let this = Self {
+            accepted,
+            rejected,
+            parquet: matches!(pipeline.output.format, OutputFormat::Parquet)
+                .then_some(ParquetChecker { schema: None }),
+            format: pipeline.output.format.clone(),
+            batch_size: pipeline.output.batch_size,
+        };
         save_report(&report)?;
         Ok((this, report))
     }
@@ -290,8 +377,10 @@ impl Artifacts {
             .map_err(|e| Error::io(&report.partial_path, e))?;
         let next = SinkState {
             committed_source_position: position,
-            committed_accepted_records: report.statistics.accepted_records_total,
-            committed_rejected_records: report.statistics.rejected_records_total,
+            committed_accepted_records: report.base_accepted_records
+                + report.statistics.accepted_records_total,
+            committed_rejected_records: report.base_rejected_records
+                + report.statistics.rejected_records_total,
             accepted_bytes: self
                 .accepted
                 .metadata()
@@ -421,6 +510,24 @@ fn create_directory_durable(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
         Err(error) => Err(Error::io(path, error)),
     }
+}
+
+fn open_append_truncated(path: &Path, committed_bytes: u64) -> Result<File> {
+    let file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| Error::io(path, e))?;
+    let actual = file.metadata().map_err(|e| Error::io(path, e))?.len();
+    if actual < committed_bytes {
+        return Err(Error::Configuration(format!(
+            "committed prefix is shorter than the manifest records: {}",
+            path.display()
+        )));
+    }
+    file.set_len(committed_bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| Error::io(path, e))?;
+    Ok(file)
 }
 
 fn create_new(path: &Path) -> Result<File> {

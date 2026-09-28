@@ -10,7 +10,9 @@ pub mod source;
 pub mod spec;
 pub mod template;
 
-pub use engine::{RunStatistics, run, run_async, run_with_provider};
+pub use engine::{
+    RunStatistics, resume_async, resume_with_provider, run, run_async, run_with_provider,
+};
 pub use error::{Error, Result};
-pub use run::{RunReport, RunStatus};
+pub use run::{ResumedFrom, RunReport, RunStatus};
 pub use spec::Pipeline;

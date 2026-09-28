@@ -25,6 +25,12 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
+    /// Continue the failed or cancelled run recorded in the output manifest.
+    Resume {
+        pipeline: PathBuf,
+        #[arg(long)]
+        strict: bool,
+    },
 }
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -56,7 +62,8 @@ async fn execute(cli: Cli) -> synthflow::Result<ExitCode> {
     let path = match &cli.command {
         Command::Validate { pipeline }
         | Command::Plan { pipeline }
-        | Command::Run { pipeline, .. } => pipeline,
+        | Command::Run { pipeline, .. }
+        | Command::Resume { pipeline, .. } => pipeline,
     };
     let mut pipeline = Pipeline::load(path)?;
     match cli.command {
@@ -65,7 +72,7 @@ async fn execute(cli: Cli) -> synthflow::Result<ExitCode> {
             pipeline.dataset.name, pipeline.version
         ),
         Command::Plan { .. } => println!("{}", pipeline.plan()),
-        Command::Run { strict, .. } => {
+        Command::Run { strict, .. } | Command::Resume { strict, .. } => {
             pipeline.errors.strict |= strict;
             let cancellation = CancellationToken::new();
             let signal_token = cancellation.clone();
@@ -77,7 +84,10 @@ async fn execute(cli: Cli) -> synthflow::Result<ExitCode> {
                     }
                 }
             });
-            let result = synthflow::run_async(&pipeline, cancellation).await;
+            let result = match cli.command {
+                Command::Resume { .. } => synthflow::resume_async(&pipeline, cancellation).await,
+                _ => synthflow::run_async(&pipeline, cancellation).await,
+            };
             signals.abort();
             let report = result?;
             println!(

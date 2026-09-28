@@ -96,6 +96,126 @@ pub async fn run_with_provider(
     provider: Arc<dyn LlmProvider>,
     cancellation: CancellationToken,
 ) -> Result<RunReport> {
+    execute(pipeline, provider, cancellation, None).await
+}
+
+/// Continue the failed or cancelled run recorded in the output manifest.
+/// Rejects changed pipelines or sources, truncates to the committed prefix,
+/// rebuilds dedup state, and skips already committed source positions.
+pub async fn resume_async(
+    pipeline: &Pipeline,
+    cancellation: CancellationToken,
+) -> Result<RunReport> {
+    pipeline.validate()?;
+    let config = pipeline
+        .providers
+        .get(&pipeline.generate.provider)
+        .ok_or_else(|| Error::Configuration("unknown provider".into()))?;
+    resume_with_provider(pipeline, create_provider(config)?, cancellation).await
+}
+
+pub async fn resume_with_provider(
+    pipeline: &Pipeline,
+    provider: Arc<dyn LlmProvider>,
+    cancellation: CancellationToken,
+) -> Result<RunReport> {
+    pipeline.validate()?;
+    if !(1..=1024).contains(&provider.concurrency()) {
+        return Err(Error::Configuration(
+            "provider concurrency must be in 1..=1024".into(),
+        ));
+    }
+    let prior = prior_manifest(pipeline)?;
+    let source_hash = source_fingerprint(pipeline, &cancellation).await?;
+    if source_hash != prior.source_fingerprint {
+        return Err(Error::Configuration(
+            "source changed since the recorded run; refusing to resume".into(),
+        ));
+    }
+    let mut dedup = pipeline.dedup.as_ref().map(DedupState::new);
+    if let Some(state) = &mut dedup
+        && let Err(error) = committed_rows(&prior)
+            .and_then(|rows| rows.iter().try_for_each(|row| state.restore(row)))
+    {
+        return Err(Error::Configuration(format!(
+            "cannot rebuild dedup state from the committed prefix: {error}"
+        )));
+    }
+    let context = ResumeContext {
+        skip_through: prior.sink_state.committed_source_position,
+        dedup,
+        prior,
+    };
+    execute(pipeline, provider, cancellation, Some(context)).await
+}
+
+struct ResumeContext {
+    skip_through: u64,
+    dedup: Option<DedupState>,
+    prior: crate::run::RunReport,
+}
+
+fn prior_manifest(pipeline: &Pipeline) -> Result<crate::run::RunReport> {
+    let manifest = crate::spec::suffix(
+        &crate::spec::normalize_path(&pipeline.output.path)?,
+        ".manifest.json",
+    );
+    let bytes = std::fs::read(&manifest).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::Configuration(format!("no run manifest to resume: {}", manifest.display()))
+        } else {
+            Error::io(&manifest, e)
+        }
+    })?;
+    let prior: crate::run::RunReport = serde_json::from_slice(&bytes)
+        .map_err(|_| Error::Configuration("recorded manifest is not valid JSON".into()))?;
+    if prior.pipeline_hash != pipeline.hash()? {
+        return Err(Error::Configuration(
+            "pipeline changed since the recorded run; use a new output path".into(),
+        ));
+    }
+    match prior.status {
+        crate::run::RunStatus::Failed | crate::run::RunStatus::Cancelled => Ok(prior),
+        crate::run::RunStatus::Completed => Err(Error::Configuration(
+            "the recorded run completed; nothing to resume".into(),
+        )),
+        crate::run::RunStatus::Running | crate::run::RunStatus::Publishing => {
+            Err(Error::Configuration(
+                "the recorded run has no terminal state; it may still be running".into(),
+            ))
+        }
+    }
+}
+
+/// The accepted rows of the committed prefix, used to rebuild dedup state.
+fn committed_rows(prior: &crate::run::RunReport) -> Result<Vec<Value>> {
+    use std::io::{BufRead, Read};
+    let file =
+        std::fs::File::open(&prior.partial_path).map_err(|e| Error::io(&prior.partial_path, e))?;
+    let mut rows = Vec::new();
+    for line in std::io::BufReader::new(file)
+        .take(prior.sink_state.accepted_bytes)
+        .lines()
+    {
+        let line = line.map_err(|e| Error::io(&prior.partial_path, e))?;
+        rows.push(serde_json::from_str(&line).map_err(|_| {
+            Error::Configuration("committed prefix contains an invalid row".into())
+        })?);
+    }
+    if rows.len() as u64 != prior.sink_state.committed_accepted_records {
+        return Err(Error::Configuration(
+            "committed prefix does not match the recorded row count".into(),
+        ));
+    }
+    Ok(rows)
+}
+
+async fn execute(
+    pipeline: &Pipeline,
+    provider: Arc<dyn LlmProvider>,
+    cancellation: CancellationToken,
+    resume: Option<ResumeContext>,
+) -> Result<RunReport> {
     pipeline.validate()?;
     if !(1..=1024).contains(&provider.concurrency()) {
         return Err(Error::Configuration(
@@ -107,10 +227,34 @@ pub async fn run_with_provider(
     env.add_template("generate", &pipeline.generate.prompt)
         .map_err(|_| Error::Configuration("invalid generation template".into()))?;
     let judge = build_judge(pipeline)?;
-    let mut dedup = pipeline.dedup.as_ref().map(DedupState::new);
     let source_hash = source_fingerprint(pipeline, &cancellation).await?;
     let mut source = Source::open(&pipeline.source)?;
-    let (mut artifacts, mut report) = Artifacts::create(pipeline, source_hash)?;
+    let (mut artifacts, mut report, skip_through, mut dedup) = match resume {
+        None => {
+            let (artifacts, report) = Artifacts::create(pipeline, source_hash)?;
+            (
+                artifacts,
+                report,
+                0,
+                pipeline.dedup.as_ref().map(DedupState::new),
+            )
+        }
+        Some(context) => {
+            let ResumeContext {
+                skip_through,
+                dedup,
+                prior,
+            } = context;
+            let (artifacts, report) = Artifacts::resume(pipeline, source_hash, &prior)?;
+            tracing::info!(
+                run_id = report.run_id,
+                resumed_from = prior.run_id,
+                skip_through,
+                event = "run_resumed"
+            );
+            (artifacts, report, skip_through, dedup)
+        }
+    };
     let started = Instant::now();
     tracing::info!(run_id = report.run_id, event = "run_started");
     let tools = StageTools {
@@ -130,6 +274,9 @@ pub async fn run_with_provider(
                 match source.next() {
                     Some(Ok((position, data))) => {
                         report.statistics.source_records_total += 1;
+                        if position <= skip_through {
+                            continue; // already durable from the resumed run
+                        }
                         pending.push_back(process(position, data, &tools, &cancellation));
                     }
                     Some(Err(error)) => {
@@ -206,7 +353,7 @@ pub async fn run_with_provider(
             refresh(&mut report, started, provider.as_ref());
             artifacts.commit(&mut report, outcome.position)?;
             if rejected && pipeline.errors.strict { return Err(Error::FailurePolicy("strict mode rejects any failed record".into())); }
-            if pipeline.errors.max_failed_records.is_some_and(|max| report.statistics.rejected_records_total > max) {
+            if pipeline.errors.max_failed_records.is_some_and(|max| report.base_rejected_records + report.statistics.rejected_records_total > max) {
                 return Err(Error::FailurePolicy("max_failed_records exceeded".into()));
             }
             // Ready mock responses and synchronous file operations must still let
@@ -214,9 +361,13 @@ pub async fn run_with_provider(
             tokio::task::yield_now().await;
         }
         if let Some(error) = source_error.take() { return Err(error); }
-        if report.statistics.processed_records_total > 0 {
-            let ratio = report.statistics.rejected_records_total as f64 / report.statistics.processed_records_total as f64;
-            if ratio == 1.0 { return Err(Error::FailurePolicy("all records were rejected".into())); }
+        // Failure policies judge the whole dataset, including the prefix a
+        // resumed run inherited, not just this run's slice.
+        let accepted_all = report.base_accepted_records + report.statistics.accepted_records_total;
+        let rejected_all = report.base_rejected_records + report.statistics.rejected_records_total;
+        if accepted_all + rejected_all > 0 {
+            let ratio = rejected_all as f64 / (accepted_all + rejected_all) as f64;
+            if ratio == 1.0 && accepted_all == 0 { return Err(Error::FailurePolicy("all records were rejected".into())); }
             if pipeline.errors.max_failed_ratio.is_some_and(|limit| ratio > limit) { return Err(Error::FailurePolicy("max_failed_ratio exceeded".into())); }
         }
         if source_fingerprint(pipeline, &cancellation).await? != report.source_fingerprint {
