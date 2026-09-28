@@ -1,9 +1,11 @@
 use crate::{
     Error, Pipeline, Result,
-    dedup::DedupState,
+    dedup::{DedupAdmission, DedupState},
     provider::{GenerateRequest, LlmProvider, ProviderStatistics, create_provider},
     record::{RecordMeta, record_id},
-    run::{Artifacts, RunReport, RunStatus, WriteResult, fingerprint, now_ms, save_report},
+    run::{
+        Artifacts, RunLock, RunReport, RunStatus, WriteResult, fingerprint, now_ms, save_report,
+    },
     source::Source,
     template,
 };
@@ -116,7 +118,9 @@ pub async fn run_with_provider(
     provider: Arc<dyn LlmProvider>,
     cancellation: CancellationToken,
 ) -> Result<RunReport> {
-    execute(pipeline, provider, cancellation, None).await
+    pipeline.validate()?;
+    let lock = RunLock::acquire(&crate::spec::normalize_path(&pipeline.output.path)?)?;
+    execute(pipeline, provider, cancellation, None, lock).await
 }
 
 /// Continue the failed or cancelled run recorded in the output manifest.
@@ -145,7 +149,21 @@ pub async fn resume_with_provider(
             "provider concurrency must be in 1..=1024".into(),
         ));
     }
+    // The lock is taken before any checkpoint read so a loser re-reads the
+    // winner's terminal state instead of truncating shared artifacts.
+    let lock = RunLock::acquire(&crate::spec::normalize_path(&pipeline.output.path)?)?;
     let prior = prior_manifest(pipeline)?;
+    // A prefix that already violates the active policies cannot be resumed
+    // into a published dataset; fail before touching any artifact.
+    if let Some(violation) = policies_violated(
+        pipeline,
+        prior.sink_state.committed_accepted_records,
+        prior.sink_state.committed_rejected_records,
+    ) {
+        return Err(Error::FailurePolicy(format!(
+            "{violation}; refusing to resume"
+        )));
+    }
     let source_hash = source_fingerprint(pipeline, &cancellation).await?;
     if source_hash != prior.source_fingerprint {
         return Err(Error::Configuration(
@@ -166,7 +184,7 @@ pub async fn resume_with_provider(
         dedup,
         prior,
     };
-    execute(pipeline, provider, cancellation, Some(context)).await
+    execute(pipeline, provider, cancellation, Some(context), lock).await
 }
 
 struct ResumeContext {
@@ -207,6 +225,36 @@ fn prior_manifest(pipeline: &Pipeline) -> Result<crate::run::RunReport> {
     }
 }
 
+/// Evaluate every failure policy over dataset-wide counts. Resume runs
+/// inherit the committed prefix, so violations that already exist must not
+/// become publishable just because no new record was processed.
+fn policies_violated(pipeline: &Pipeline, accepted: u64, rejected: u64) -> Option<&'static str> {
+    if pipeline.errors.strict && rejected > 0 {
+        return Some("strict mode rejects any failed record");
+    }
+    if pipeline
+        .errors
+        .max_failed_records
+        .is_some_and(|max| rejected > max)
+    {
+        return Some("max_failed_records exceeded");
+    }
+    if accepted + rejected > 0 {
+        let ratio = rejected as f64 / (accepted + rejected) as f64;
+        if accepted == 0 {
+            return Some("all records were rejected");
+        }
+        if pipeline
+            .errors
+            .max_failed_ratio
+            .is_some_and(|limit| ratio > limit)
+        {
+            return Some("max_failed_ratio exceeded");
+        }
+    }
+    None
+}
+
 /// The accepted rows of the committed prefix, used to rebuild dedup state.
 fn committed_rows(prior: &crate::run::RunReport) -> Result<Vec<Value>> {
     use std::io::{BufRead, Read};
@@ -235,6 +283,9 @@ async fn execute(
     provider: Arc<dyn LlmProvider>,
     cancellation: CancellationToken,
     resume: Option<ResumeContext>,
+    // Held until this function returns: run/resume, publication, and every
+    // manifest write happen under the same exclusive namespace lock.
+    _run_lock: RunLock,
 ) -> Result<RunReport> {
     pipeline.validate()?;
     if !(1..=1024).contains(&provider.concurrency()) {
@@ -331,15 +382,31 @@ async fn execute(
                         input.insert("judge".into(), json!({"provider": judge.provider, "model": judge.model, "score": judge.score}));
                     }
                     input.insert("generated".into(), generated.value);
-                    // Dedup keys cover input plus generated; metadata is per-run.
-                    let verdict = match &mut dedup {
-                        Some(state) => state
-                            .insert(&Value::Object(input.clone()))
-                            .and_then(|duplicate| if duplicate { Err(Error::Duplicate) } else { Ok(()) }),
-                        None => Ok(()),
+                    // Dedup keys cover input plus generated; metadata is
+                    // per-run. Admission registers only after the sink
+                    // accepts the record, so sink-rejected rows never
+                    // pollute the state; missing key fields reject the
+                    // record itself instead of failing the run.
+                    let admission = match &dedup {
+                        None => DedupOutcome::Proceed(None),
+                        Some(state) => match state.check(&Value::Object(input.clone())) {
+                            Ok(DedupAdmission::Duplicate) => {
+                                DedupOutcome::Reject(Error::Duplicate)
+                            }
+                            Ok(DedupAdmission::Unique(key)) => DedupOutcome::Proceed(Some(key)),
+                            Err(error @ Error::DedupField { .. }) => DedupOutcome::Reject(error),
+                            Err(error) => return Err(error),
+                        },
                     };
-                    match verdict {
-                        Ok(()) => {
+                    match admission {
+                        DedupOutcome::Reject(error) => {
+                            if matches!(error, Error::Duplicate) {
+                                report.statistics.duplicate_records_total += 1;
+                            }
+                            write_rejection(&mut artifacts, &mut report, &id, outcome.position, &error, outcome.attempts)?;
+                            true
+                        }
+                        DedupOutcome::Proceed(key) => {
                             let meta = RecordMeta {
                                 record_id: id.clone(), run_id: report.run_id.clone(), source_position: outcome.position,
                                 pipeline_hash: report.pipeline_hash.clone(), pipeline_version: pipeline.version,
@@ -353,6 +420,9 @@ async fn execute(
                             input.insert("_meta".into(), serde_json::to_value(meta).map_err(|_| Error::Sink("metadata serialization failed".into()))?);
                             match artifacts.write_accepted(outcome.position, &Value::Object(input))? {
                                 WriteResult::Written => {
+                                    if let (Some(state), Some(key)) = (&mut dedup, key) {
+                                        state.register(key);
+                                    }
                                     report.statistics.accepted_records_total += 1;
                                     false
                                 }
@@ -361,13 +431,6 @@ async fn execute(
                                     true
                                 }
                             }
-                        }
-                        Err(error) => {
-                            if matches!(error, Error::Duplicate) {
-                                report.statistics.duplicate_records_total += 1;
-                            }
-                            write_rejection(&mut artifacts, &mut report, &id, outcome.position, &error, outcome.attempts)?;
-                            true
                         }
                     }
                 }
@@ -400,14 +463,14 @@ async fn execute(
             tokio::task::yield_now().await;
         }
         if let Some(error) = source_error.take() { return Err(error); }
-        // Failure policies judge the whole dataset, including the prefix a
-        // resumed run inherited, not just this run's slice.
-        let accepted_all = report.base_accepted_records + report.statistics.accepted_records_total;
-        let rejected_all = report.base_rejected_records + report.statistics.rejected_records_total;
-        if accepted_all + rejected_all > 0 {
-            let ratio = rejected_all as f64 / (accepted_all + rejected_all) as f64;
-            if ratio == 1.0 && accepted_all == 0 { return Err(Error::FailurePolicy("all records were rejected".into())); }
-            if pipeline.errors.max_failed_ratio.is_some_and(|limit| ratio > limit) { return Err(Error::FailurePolicy("max_failed_ratio exceeded".into())); }
+        // Re-validate every policy over dataset-wide counts before publishing;
+        // a resume with no new input must not publish an already-violating run.
+        if let Some(violation) = policies_violated(
+            pipeline,
+            report.base_accepted_records + report.statistics.accepted_records_total,
+            report.base_rejected_records + report.statistics.rejected_records_total,
+        ) {
+            return Err(Error::FailurePolicy(violation.into()));
         }
         if source_fingerprint(pipeline, &cancellation).await? != report.source_fingerprint {
             return Err(Error::Source { position: report.sink_state.committed_source_position, message: "source changed during execution; output was not published".into() });
@@ -520,6 +583,13 @@ async fn source_fingerprint(
     tokio::task::spawn_blocking(move || fingerprint(&source, &cancellation))
         .await
         .map_err(|_| Error::RunFailed("source fingerprint worker failed".into()))?
+}
+
+/// Dedup decision for one record: reject it, or proceed carrying the key to
+/// register once the sink accepts.
+enum DedupOutcome {
+    Reject(Error),
+    Proceed(Option<crate::dedup::PreparedKey>),
 }
 
 struct Generated {

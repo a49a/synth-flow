@@ -5,6 +5,7 @@ use crate::{
     spec::{OutputFormat, SourceConfig, normalize_path, suffix},
 };
 use arrow::datatypes::SchemaRef;
+use fs2::FileExt;
 use parquet::{arrow::arrow_writer::ArrowWriter, file::properties::WriterProperties};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -81,6 +82,42 @@ pub fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// Exclusive, advisory, cross-process lock over one output namespace. A run
+/// or resume holds it from the first checkpoint read until the final manifest
+/// write; concurrent attempts fail fast instead of racing on shared files.
+pub(crate) struct RunLock {
+    file: File,
+}
+
+impl RunLock {
+    pub(crate) fn acquire(output: &Path) -> Result<Self> {
+        let lock_path = suffix(output, ".lock");
+        if let Some(parent) = lock_path.parent() {
+            create_directory_durable(parent)?;
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| Error::io(&lock_path, e))?;
+        file.try_lock_exclusive().map_err(|_| {
+            Error::Configuration(format!(
+                "another process holds the run lock: {}",
+                lock_path.display()
+            ))
+        })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        // Release explicitly; the file itself may outlive the run harmlessly.
+        let _ = self.file.unlock();
+    }
 }
 
 pub fn fingerprint(source: &SourceConfig, cancellation: &CancellationToken) -> Result<String> {
@@ -211,7 +248,8 @@ impl Artifacts {
         let partial = suffix(&output, ".partial");
         let manifest = suffix(&output, ".manifest.json");
         let dead = pipeline.dead_letter_path()?;
-        for path in [&output, &partial, &manifest, &dead] {
+        let publishing = suffix(&output, ".publishing");
+        for path in [&output, &partial, &manifest, &dead, &publishing] {
             if path.try_exists().map_err(|e| Error::io(path, e))? {
                 return Err(Error::Configuration(format!(
                     "run artifact already exists: {}",
@@ -309,6 +347,10 @@ impl Artifacts {
         }
         let accepted = open_append_truncated(&partial, prior.sink_state.accepted_bytes)?;
         let rejected = open_append_truncated(&dead, prior.sink_state.rejected_bytes)?;
+        let parquet = matches!(pipeline.output.format, OutputFormat::Parquet)
+            .then(|| committed_parquet_schema(&partial, prior))
+            .transpose()?
+            .map(|schema| ParquetChecker { schema });
         let model = match pipeline.providers.get(&pipeline.generate.provider) {
             Some(crate::spec::ProviderConfig::OpenaiCompatible { model, .. }) => model.clone(),
             _ => "synthflow-mock-v1".into(),
@@ -341,8 +383,7 @@ impl Artifacts {
         let this = Self {
             accepted,
             rejected,
-            parquet: matches!(pipeline.output.format, OutputFormat::Parquet)
-                .then_some(ParquetChecker { schema: None }),
+            parquet,
             format: pipeline.output.format.clone(),
             batch_size: pipeline.output.batch_size,
         };
@@ -408,15 +449,29 @@ impl Artifacts {
     }
 
     pub fn publish(&mut self, report: &mut RunReport) -> Result<()> {
-        if matches!(self.format, OutputFormat::Parquet) {
-            write_parquet_output(report, self.batch_size)?;
-        }
+        // Parquet publishes the staged conversion; JSONL publishes the
+        // partial itself. Either way the link source is fully synced first.
+        let link_source = match self.format {
+            OutputFormat::Jsonl => report.partial_path.clone(),
+            OutputFormat::Parquet => write_parquet_output(report, self.batch_size)?,
+        };
         report.status = RunStatus::Publishing;
-        save_report(report)?;
+        if let Err(error) = save_report(report) {
+            if link_source != report.partial_path {
+                let _ = fs::remove_file(&link_source);
+            }
+            return Err(error);
+        }
         // Same-directory hard link publishes a fully synced file atomically and
         // fails if another process created the final output. rename would clobber.
-        fs::hard_link(&report.partial_path, &report.output_path)
-            .map_err(|e| Error::io(&report.output_path, e))?;
+        if let Err(e) = fs::hard_link(&link_source, &report.output_path) {
+            // The JSONL checkpoint survives every publish failure; only the
+            // disposable staged conversion is cleaned up here.
+            if link_source != report.partial_path {
+                let _ = fs::remove_file(&link_source);
+            }
+            return Err(Error::io(&report.output_path, e));
+        }
         let finalize = (|| {
             sync_parent(&report.output_path)?;
             report.status = RunStatus::Completed;
@@ -426,12 +481,20 @@ impl Artifacts {
             // This link was created by us above; never remove a pre-existing output.
             fs::remove_file(&report.output_path).map_err(|e| Error::io(&report.output_path, e))?;
             sync_parent(&report.output_path)?;
+            if link_source != report.partial_path {
+                let _ = fs::remove_file(&link_source);
+            }
             return Err(error);
         }
-        // A leftover partial link is harmless if cleanup fails after publication.
-        if let Err(e) = fs::remove_file(&report.partial_path).and_then(|_| {
+        // Only after the completed state is durable do intermediates expire:
+        // the staged conversion and, for parquet runs, the JSONL checkpoint.
+        if let Err(e) = (|| -> std::io::Result<()> {
+            if link_source != report.partial_path {
+                fs::remove_file(&link_source)?;
+            }
+            fs::remove_file(&report.partial_path)?;
             File::open(report.output_path.parent().unwrap_or(Path::new(".")))?.sync_all()
-        }) {
+        })() {
             tracing::warn!(error = %e, event = "partial_cleanup_failed");
         }
         Ok(())
@@ -440,30 +503,34 @@ impl Artifacts {
 
 /// Convert the durable JSONL partial into the final parquet file. The
 /// temporary conversion lives next to the output so publication is still an
-/// atomic same-directory hard link.
-fn write_parquet_output(report: &RunReport, batch_size: usize) -> Result<()> {
+/// atomic same-directory hard link. The JSONL partial is the resume
+/// checkpoint and is never modified: a later publish failure must still be
+/// able to truncate and parse it as JSONL.
+fn write_parquet_output(report: &RunReport, batch_size: usize) -> Result<PathBuf> {
     let staged = suffix(&report.output_path, ".publishing");
+    // An existing staged path can belong to another writer or a failed
+    // process. Never delete it implicitly.
     let file = create_new(&staged)?;
-    let schema = match report.sink_state.committed_accepted_records {
-        0 => SchemaRef::new(arrow::datatypes::Schema::empty()),
-        _ => {
-            let partial =
-                File::open(&report.partial_path).map_err(|e| Error::io(&report.partial_path, e))?;
-            let lines = std::io::BufReader::new(partial).lines().map(|line| {
-                let line =
-                    line.map_err(|e| arrow_schema::ArrowError::ExternalError(Box::new(e)))?;
-                serde_json::from_str::<Value>(&line).map_err(|e| {
-                    arrow_schema::ArrowError::ExternalError(Box::new(std::io::Error::other(
-                        format!("partial row is not valid JSON: {e}"),
-                    )))
-                })
-            });
-            let schema = arrow_json::reader::infer_json_schema_from_iterator(lines)
-                .map_err(|e| Error::Sink(format!("parquet schema inference failed: {e}")))?;
-            SchemaRef::new(schema)
-        }
-    };
     let result = (|| -> Result<()> {
+        let schema = match report.sink_state.committed_accepted_records {
+            0 => SchemaRef::new(arrow::datatypes::Schema::empty()),
+            _ => {
+                let partial = File::open(&report.partial_path)
+                    .map_err(|e| Error::io(&report.partial_path, e))?;
+                let lines = std::io::BufReader::new(partial).lines().map(|line| {
+                    let line =
+                        line.map_err(|e| arrow_schema::ArrowError::ExternalError(Box::new(e)))?;
+                    serde_json::from_str::<Value>(&line).map_err(|e| {
+                        arrow_schema::ArrowError::ExternalError(Box::new(std::io::Error::other(
+                            format!("partial row is not valid JSON: {e}"),
+                        )))
+                    })
+                });
+                let schema = arrow_json::reader::infer_json_schema_from_iterator(lines)
+                    .map_err(|e| Error::Sink(format!("parquet schema inference failed: {e}")))?;
+                SchemaRef::new(schema)
+            }
+        };
         let properties = WriterProperties::builder()
             .set_max_row_group_row_count(Some(batch_size.max(1)))
             .build();
@@ -487,15 +554,17 @@ fn write_parquet_output(report: &RunReport, batch_size: usize) -> Result<()> {
         writer
             .close()
             .map_err(|e| Error::Sink(format!("parquet close failed: {e}")))?;
+        File::open(&staged)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| Error::io(&staged, e))?;
+        sync_parent(&staged)?;
         Ok(())
     })();
     if let Err(error) = result {
         let _ = fs::remove_file(&staged);
         return Err(error);
     }
-    // The staged file replaces the hard-link source for publication.
-    fs::rename(&staged, &report.partial_path).map_err(|e| Error::io(&report.partial_path, e))?;
-    sync_parent(&report.partial_path)
+    Ok(staged)
 }
 
 fn create_directory_durable(path: &Path) -> Result<()> {
@@ -510,6 +579,30 @@ fn create_directory_durable(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
         Err(error) => Err(Error::io(path, error)),
     }
+}
+
+/// Rebuild the parquet schema a continuous run would have inferred: take the
+/// first row of the committed prefix. All committed rows were checked against
+/// that schema, so inference over them yields the same fields and types.
+fn committed_parquet_schema(partial: &Path, prior: &RunReport) -> Result<Option<SchemaRef>> {
+    use std::io::{BufRead, Read};
+    if prior.sink_state.committed_accepted_records == 0 {
+        // Nothing committed: a fresh inference on the first new record matches
+        // what a continuous run would have done.
+        return Ok(None);
+    }
+    let file = File::open(partial).map_err(|e| Error::io(partial, e))?;
+    let mut line = String::new();
+    std::io::BufReader::new(file)
+        .take(prior.sink_state.accepted_bytes)
+        .read_line(&mut line)
+        .map_err(|e| Error::io(partial, e))?;
+    let value: Value = serde_json::from_str(line.trim_end())
+        .map_err(|_| Error::Configuration("committed prefix contains an invalid row".into()))?;
+    let schema =
+        arrow_json::reader::infer_json_schema_from_iterator(std::iter::once(Ok(&value)))
+            .map_err(|e| Error::Configuration(format!("cannot rebuild parquet schema: {e}")))?;
+    Ok(Some(SchemaRef::new(schema)))
 }
 
 fn open_append_truncated(path: &Path, committed_bytes: u64) -> Result<File> {

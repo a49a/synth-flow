@@ -42,8 +42,10 @@ impl DedupState {
         }
     }
 
-    /// Register a record; `Ok(true)` means it duplicates an earlier one.
-    pub(crate) fn insert(&mut self, record: &Value) -> Result<bool> {
+    /// Decide whether a record duplicates an earlier accepted one without
+    /// touching the state; the caller registers the prepared key only after
+    /// the sink accepted the record.
+    pub(crate) fn check(&self, record: &Value) -> Result<DedupAdmission> {
         match self {
             Self::Exact {
                 seen,
@@ -51,17 +53,49 @@ impl DedupState {
                 normalize,
             } => {
                 let key = exact_key(record, fields, *normalize)?;
-                Ok(!seen.insert(key))
+                if seen.contains(&key) {
+                    Ok(DedupAdmission::Duplicate)
+                } else {
+                    Ok(DedupAdmission::Unique(PreparedKey::Exact(key)))
+                }
             }
-            Self::MinHash(index) => index.insert(record),
+            Self::MinHash(index) => index.check(record),
+        }
+    }
+
+    /// Commit a unique admission into the state after sink acceptance.
+    pub(crate) fn register(&mut self, prepared: PreparedKey) {
+        match (self, prepared) {
+            (Self::Exact { seen, .. }, PreparedKey::Exact(key)) => {
+                seen.insert(key);
+            }
+            (Self::MinHash(index), PreparedKey::MinHash(signature)) => {
+                index.register(signature);
+            }
+            _ => {}
         }
     }
 
     /// Rebuild state from previously accepted records during resume.
-    #[allow(dead_code)] // consumed by the resume implementation
     pub(crate) fn restore(&mut self, record: &Value) -> Result<()> {
-        self.insert(record).map(|_| ())
+        match self.check(record)? {
+            DedupAdmission::Duplicate => Ok(()),
+            DedupAdmission::Unique(prepared) => {
+                self.register(prepared);
+                Ok(())
+            }
+        }
     }
+}
+
+pub(crate) enum DedupAdmission {
+    Duplicate,
+    Unique(PreparedKey),
+}
+
+pub(crate) enum PreparedKey {
+    Exact([u8; 32]),
+    MinHash(Vec<u64>),
 }
 
 /// Banded MinHash/LSH index over one text field. Signatures estimate Jaccard
@@ -97,7 +131,7 @@ impl MinHashIndex {
         }
     }
 
-    fn insert(&mut self, record: &Value) -> Result<bool> {
+    fn check(&self, record: &Value) -> Result<DedupAdmission> {
         let text = text_field(record, &self.field)?;
         let signature = self.signature(text);
         for band in 0..self.bands {
@@ -110,9 +144,13 @@ impl MinHashIndex {
                     similarity(&signature, &self.signatures[candidate as usize]) >= self.threshold
                 })
             {
-                return Ok(true);
+                return Ok(DedupAdmission::Duplicate);
             }
         }
+        Ok(DedupAdmission::Unique(PreparedKey::MinHash(signature)))
+    }
+
+    fn register(&mut self, signature: Vec<u64>) {
         let index = self.signatures.len() as u32;
         for band in 0..self.bands {
             let key = (
@@ -122,7 +160,6 @@ impl MinHashIndex {
             self.buckets.entry(key).or_default().push(index);
         }
         self.signatures.push(signature);
-        Ok(false)
     }
 
     fn signature(&self, text: &str) -> Vec<u64> {
@@ -274,9 +311,23 @@ mod tests {
             normalize: Normalize::Lowercase,
         };
         let mut state = DedupState::new(&config);
-        assert!(!state.insert(&record("Rust Ownership")).expect("first"));
-        assert!(state.insert(&record("rust ownership")).expect("second"));
-        assert!(!state.insert(&record("different")).expect("third"));
+        assert!(
+            state
+                .check(&record("Rust Ownership"))
+                .expect("first")
+                .is_unique()
+        );
+        let key = state
+            .check(&record("rust ownership"))
+            .expect("second")
+            .unique_key();
+        state.register(key);
+        assert!(
+            state
+                .check(&record("different"))
+                .expect("third")
+                .is_unique()
+        );
     }
 
     #[test]
@@ -285,9 +336,9 @@ mod tests {
             fields: Some(vec!["generated.missing".into()]),
             normalize: Normalize::None,
         };
-        let mut state = DedupState::new(&config);
+        let state = DedupState::new(&config);
         assert!(matches!(
-            state.insert(&record("a")),
+            state.check(&record("a")),
             Err(Error::DedupField { .. })
         ));
     }
@@ -299,11 +350,27 @@ mod tests {
             normalize: Normalize::None,
         };
         let mut state = DedupState::new(&config);
-        assert!(!state.insert(&record("a")).expect("first"));
-        assert!(state.insert(&record("a")).expect("second"));
+        let key = state.check(&record("a")).expect("first").unique_key();
+        state.register(key);
+        assert!(state.check(&record("a")).expect("second").is_duplicate());
         // The input topic differs but the generated object is the dedup key.
         let other_topic = json!({"topic": "other", "generated": {"answer": "a"}});
-        assert!(state.insert(&other_topic).expect("third"));
+        assert!(state.check(&other_topic).expect("third").is_duplicate());
+    }
+
+    impl DedupAdmission {
+        fn is_duplicate(&self) -> bool {
+            matches!(self, DedupAdmission::Duplicate)
+        }
+        fn is_unique(&self) -> bool {
+            !self.is_duplicate()
+        }
+        fn unique_key(self) -> PreparedKey {
+            match self {
+                DedupAdmission::Unique(prepared) => prepared,
+                DedupAdmission::Duplicate => panic!("expected a unique admission"),
+            }
+        }
     }
 
     fn minhash(field: &str, threshold: f64) -> DedupState {
@@ -320,26 +387,28 @@ mod tests {
     fn identical_texts_are_minhash_duplicates() {
         let text = "the quick brown fox jumps over the lazy dog again and again";
         let mut state = minhash("generated.answer", 0.8);
-        assert!(!state.insert(&record(text)).expect("first"));
-        assert!(state.insert(&record(text)).expect("second"));
+        let prepared = state.check(&record(text)).expect("first").unique_key();
+        state.register(prepared);
+        assert!(state.check(&record(text)).expect("second").is_duplicate());
     }
 
     #[test]
     fn disjoint_texts_are_not_minhash_duplicates() {
         let mut state = minhash("generated.answer", 0.8);
+        for text in [
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa",
+            "one two three four five six seven eight nine ten eleven",
+        ] {
+            let prepared = state.check(&record(text)).expect("unique").unique_key();
+            state.register(prepared);
+        }
         assert!(
             !state
-                .insert(&record(
-                    "alpha beta gamma delta epsilon zeta eta theta iota kappa"
+                .check(&record(
+                    "a completely different sentence about rust modules"
                 ))
-                .expect("first")
-        );
-        assert!(
-            !state
-                .insert(&record(
-                    "one two three four five six seven eight nine ten eleven"
-                ))
-                .expect("second")
+                .expect("third")
+                .is_duplicate()
         );
     }
 
@@ -348,8 +417,14 @@ mod tests {
         let mut state = minhash("generated.answer", 0.6);
         let base = "rust ownership moves values between owners with move semantics always";
         let variant = "rust ownership moves values between owners with move semantics usually";
-        assert!(!state.insert(&record(base)).expect("first"));
-        assert!(state.insert(&record(variant)).expect("near duplicate"));
+        let prepared = state.check(&record(base)).expect("first").unique_key();
+        state.register(prepared);
+        assert!(
+            state
+                .check(&record(variant))
+                .expect("near duplicate")
+                .is_duplicate()
+        );
     }
 
     #[test]
@@ -374,10 +449,10 @@ mod tests {
 
     #[test]
     fn non_string_fields_surface_dedup_diagnostics() {
-        let mut state = minhash("generated.count", 0.8);
+        let state = minhash("generated.count", 0.8);
         let numeric = json!({"topic": "t", "generated": {"count": 3}});
         assert!(matches!(
-            state.insert(&numeric),
+            state.check(&numeric),
             Err(Error::DedupField { .. })
         ));
     }

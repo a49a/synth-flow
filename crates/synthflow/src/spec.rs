@@ -455,11 +455,13 @@ impl Pipeline {
             suffix(&out, ".partial"),
             suffix(&out, ".manifest.json"),
             dead.clone(),
+            suffix(&out, ".lock"),
+            suffix(&out, ".publishing"),
         ];
         for (i, path) in artifacts.iter().enumerate() {
             if artifacts[..i].contains(path) {
                 return Err(invalid(
-                    "output, partial, manifest and dead-letter paths must be distinct",
+                    "output, partial, manifest, dead-letter, lock and publishing paths must be distinct",
                 ));
             }
             if let SourceConfig::Jsonl { path: source } | SourceConfig::Csv { path: source } =
