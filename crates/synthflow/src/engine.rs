@@ -51,6 +51,81 @@ pub struct RunStatistics {
     pub provider_usage: ProviderStatistics,
 }
 
+/// Bounded latency accounting: the mean is exact and incremental, while
+/// percentiles come from a uniform reservoir sample capped at
+/// [`LatencyTracker::CAP`] observations, so memory stays constant no matter
+/// how many records a run processes. Beyond the cap the percentiles are
+/// approximations of the true distribution.
+pub(crate) struct LatencyTracker {
+    count: u64,
+    sum: f64,
+    reservoir: Vec<f64>,
+}
+
+impl Default for LatencyTracker {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            sum: 0.0,
+            reservoir: Vec::new(),
+        }
+    }
+}
+
+impl LatencyTracker {
+    const CAP: usize = 4096;
+
+    fn observe(&mut self, latency_ms: f64) {
+        self.count += 1;
+        self.sum += latency_ms;
+        if self.reservoir.len() < Self::CAP {
+            self.reservoir.push(latency_ms);
+        } else {
+            // Classic reservoir sampling: observation i replaces slot j with
+            // probability CAP/i, keeping every sample equally likely.
+            let slot = rand::random_range(0..self.count) as usize;
+            if slot < Self::CAP {
+                self.reservoir[slot] = latency_ms;
+            }
+        }
+    }
+
+    fn summary(&self) -> LatencySummary {
+        if self.count == 0 {
+            return LatencySummary::default();
+        }
+        let mut sorted = self.reservoir.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite latencies"));
+        let pick = |fraction: f64| sorted[((sorted.len() - 1) as f64 * fraction).round() as usize];
+        LatencySummary {
+            mean_ms: self.sum / self.count as f64,
+            p50_ms: pick(0.50),
+            p95_ms: pick(0.95),
+            p99_ms: pick(0.99),
+        }
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::LatencyTracker;
+
+    #[test]
+    fn large_stream_keeps_bounded_samples_and_exact_mean() {
+        let mut tracker = LatencyTracker::default();
+        for i in 0..100_000 {
+            tracker.observe((i % 10) as f64);
+        }
+        assert_eq!(tracker.count, 100_000);
+        assert_eq!(tracker.reservoir.len(), LatencyTracker::CAP);
+        let summary = tracker.summary();
+        assert!((summary.mean_ms - 4.5).abs() < 1e-10);
+        assert!((0.0..=9.0).contains(&summary.p50_ms));
+        assert!(summary.p50_ms <= summary.p95_ms);
+        assert!(summary.p95_ms <= summary.p99_ms);
+    }
+}
+
 /// Generation wall-clock percentiles in milliseconds over accepted and
 /// rejected calls alike; zeros when nothing reached a provider.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -338,7 +413,7 @@ async fn execute(
     let mut pending = FuturesOrdered::new();
     let mut source_done = false;
     let mut source_error = None;
-    let mut latencies: Vec<f64> = Vec::new();
+    let mut latencies = LatencyTracker::default();
     let mut progress_at = started;
     let mut progress_count = 0u64;
     let result = async {
@@ -372,7 +447,7 @@ async fn execute(
             report.statistics.merge(&outcome.statistics);
             report.statistics.processed_records_total += 1;
             if outcome.latency_ms > 0.0 {
-                latencies.push(outcome.latency_ms);
+                latencies.observe(outcome.latency_ms);
             }
             let mut input = outcome.data.as_object().cloned().ok_or_else(|| Error::Source { position: outcome.position, message: "expected object".into() })?;
             let id = record_id(&input, outcome.position);
@@ -439,7 +514,7 @@ async fn execute(
                     true
                 }
             };
-            refresh(&mut report, started, provider.as_ref(), pipeline, &latencies);
+            refresh(&mut report, started, provider.as_ref(), pipeline);
             artifacts.commit(&mut report, outcome.position)?;
             if report.statistics.processed_records_total - progress_count >= 500
                 || progress_at.elapsed() >= std::time::Duration::from_secs(2)
@@ -479,13 +554,9 @@ async fn execute(
         Ok(())
     }.await;
     drop(pending); // Cancels in-flight HTTP work without detached tasks.
-    refresh(
-        &mut report,
-        started,
-        provider.as_ref(),
-        pipeline,
-        &latencies,
-    );
+    refresh(&mut report, started, provider.as_ref(), pipeline);
+    // Percentiles are computed once at report time, never per record.
+    report.statistics.latency = latencies.summary();
     report.finished_at_unix_ms = Some(now_ms());
     let result = result.and_then(|()| artifacts.publish(&mut report));
     if let Err(error) = result {
@@ -542,35 +613,17 @@ fn refresh(
     started: Instant,
     provider: &dyn LlmProvider,
     pipeline: &Pipeline,
-    latencies: &[f64],
 ) {
     report.statistics.elapsed_seconds = started.elapsed().as_secs_f64();
     report.statistics.records_per_second = report.statistics.processed_records_total as f64
         / report.statistics.elapsed_seconds.max(f64::EPSILON);
     report.statistics.provider_usage = provider.statistics();
-    report.statistics.latency = summarize(latencies);
     if let Some(pricing) = &pipeline.pricing {
         report.statistics.estimated_cost_usd = Some(
             (report.statistics.prompt_tokens_total as f64 * pricing.input_usd_per_mtok
                 + report.statistics.completion_tokens_total as f64 * pricing.output_usd_per_mtok)
                 / 1_000_000.0,
         );
-    }
-}
-
-/// Nearest-rank percentiles over the recorded generation latencies.
-fn summarize(latencies: &[f64]) -> LatencySummary {
-    if latencies.is_empty() {
-        return LatencySummary::default();
-    }
-    let mut sorted = latencies.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite latencies"));
-    let pick = |fraction: f64| sorted[((sorted.len() - 1) as f64 * fraction).round() as usize];
-    LatencySummary {
-        mean_ms: sorted.iter().sum::<f64>() / sorted.len() as f64,
-        p50_ms: pick(0.50),
-        p95_ms: pick(0.95),
-        p99_ms: pick(0.99),
     }
 }
 
