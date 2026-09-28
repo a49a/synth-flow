@@ -100,6 +100,8 @@ pub struct Generation {
     pub provider: String,
     pub prompt: String,
     pub output_schema: Value,
+    #[serde(default)]
+    pub regenerate_on_invalid: u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -176,6 +178,9 @@ impl Pipeline {
         }
         if self.generate.prompt.trim().is_empty() {
             return Err(invalid("generate.prompt cannot be empty"));
+        }
+        if self.generate.regenerate_on_invalid > 3 {
+            return Err(invalid("generate.regenerate_on_invalid must be in 0..=3"));
         }
         template::validate(&self.generate.prompt, "generation")?;
         for provider in self.providers.values() {
@@ -388,8 +393,16 @@ impl Pipeline {
             SourceConfig::Inline { .. } => "InlineSource",
             SourceConfig::Jsonl { .. } => "JsonlSource",
         };
+        let regenerate = if self.generate.regenerate_on_invalid > 0 {
+            format!(
+                "\n  ↓\nRegenerate(x{})",
+                self.generate.regenerate_on_invalid
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "{source}\n  ↓\nPromptRender\n  ↓\nGenerate({})\n  ↓\nJsonParse\n  ↓\nSchemaValidate\n  ↓\nJsonlSink",
+            "{source}\n  ↓\nPromptRender\n  ↓\nGenerate({})\n  ↓\nJsonParse\n  ↓\nSchemaValidate{regenerate}\n  ↓\nJsonlSink",
             self.generate.provider
         )
     }

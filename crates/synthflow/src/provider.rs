@@ -21,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 pub struct GenerateRequest<'a> {
     pub prompt: &'a str,
     pub record: &'a Value,
+    /// Structured-output repair feedback for regeneration attempts.
+    pub feedback: Option<&'a str>,
 }
 pub struct GenerateResponse {
     pub text: String,
@@ -109,7 +111,7 @@ impl LlmProvider for MockProvider {
             return Err(Error::Cancelled);
         }
         self.metrics.requests.fetch_add(1, Ordering::Relaxed);
-        let context = json!({"record": request.record, "prompt": request.prompt, "prompt_hash": blake3::hash(request.prompt.as_bytes()).to_hex().to_string()});
+        let context = json!({"record": request.record, "prompt": request.prompt, "prompt_hash": blake3::hash(request.prompt.as_bytes()).to_hex().to_string(), "feedback": request.feedback});
         Ok(GenerateResponse {
             text: template::render(&self.env, "mock", &context)?,
             model: "synthflow-mock-v1".into(),
@@ -195,8 +197,16 @@ impl OpenAiProvider {
             status,
             attempts: attempt,
         };
+        // Repair feedback rides in the user message; the base prompt hash stays stable.
+        let content = match request.feedback {
+            Some(feedback) => format!(
+                "{}\n\nYour previous reply was rejected: {feedback}\nReply again with a corrected JSON object only.",
+                request.prompt
+            ),
+            None => request.prompt.to_owned(),
+        };
         let mut builder = self.client.post(&self.endpoint).json(&json!({
-            "model": self.model, "messages": [{"role":"user", "content":request.prompt}],
+            "model": self.model, "messages": [{"role":"user", "content": content}],
             "response_format": {"type":"json_object"}
         }));
         if let Some(key) = &self.key {

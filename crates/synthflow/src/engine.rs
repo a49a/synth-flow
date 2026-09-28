@@ -20,6 +20,8 @@ pub struct RunStatistics {
     pub generation_requests_total: u64,
     pub generation_success_total: u64,
     pub generation_failed_total: u64,
+    #[serde(default)]
+    pub regeneration_attempts_total: u64,
     pub template_failed_total: u64,
     pub structured_output_failed_total: u64,
     pub validation_failed_total: u64,
@@ -34,6 +36,7 @@ impl RunStatistics {
         self.generation_requests_total += other.generation_requests_total;
         self.generation_success_total += other.generation_success_total;
         self.generation_failed_total += other.generation_failed_total;
+        self.regeneration_attempts_total += other.regeneration_attempts_total;
         self.template_failed_total += other.template_failed_total;
         self.structured_output_failed_total += other.structured_output_failed_total;
         self.validation_failed_total += other.validation_failed_total;
@@ -105,7 +108,15 @@ pub async fn run_with_provider(
                 match source.next() {
                     Some(Ok((position, data))) => {
                         report.statistics.source_records_total += 1;
-                        pending.push_back(process(position, data, &env, provider.as_ref(), &schema, &cancellation));
+                        pending.push_back(process(
+                            position,
+                            data,
+                            &env,
+                            provider.as_ref(),
+                            &schema,
+                            pipeline.generate.regenerate_on_invalid,
+                            &cancellation,
+                        ));
                     }
                     Some(Err(error)) => {
                         report.statistics.source_records_total += 1;
@@ -238,52 +249,76 @@ async fn process(
     env: &minijinja::Environment<'_>,
     provider: &dyn LlmProvider,
     schema: &jsonschema::Validator,
+    regenerate_on_invalid: u32,
     cancellation: &CancellationToken,
 ) -> Outcome {
     let mut statistics = RunStatistics::default();
-    let mut attempts = 1;
+    let mut attempts = 0;
     let result = async {
         let mut context = data.as_object().cloned().unwrap_or_default();
         context.insert("record".into(), data.clone());
         let prompt = template::render(env, "generate", &json!(context)).inspect_err(|_| {
             statistics.template_failed_total += 1;
         })?;
-        statistics.generation_requests_total += 1;
-        let response = provider
-            .generate(
-                GenerateRequest {
-                    prompt: &prompt,
-                    record: &data,
-                },
-                cancellation,
-            )
-            .await
-            .inspect_err(|_| {
-                statistics.generation_failed_total += 1;
-            })?;
-        statistics.generation_success_total += 1;
-        attempts = response.attempts;
-        let generated: Value = serde_json::from_str(&response.text).map_err(|_| {
-            statistics.structured_output_failed_total += 1;
-            Error::StructuredOutput
-        })?;
-        if !generated.is_object() {
-            statistics.structured_output_failed_total += 1;
-            return Err(Error::StructuredOutput);
+        let mut feedback: Option<String> = None;
+        let mut regenerations = 0;
+        loop {
+            statistics.generation_requests_total += 1;
+            let response = provider
+                .generate(
+                    GenerateRequest {
+                        prompt: &prompt,
+                        record: &data,
+                        feedback: feedback.as_deref(),
+                    },
+                    cancellation,
+                )
+                .await
+                .inspect_err(|_| {
+                    statistics.generation_failed_total += 1;
+                })?;
+            statistics.generation_success_total += 1;
+            attempts += response.attempts.max(1);
+            let structured = serde_json::from_str::<Value>(&response.text)
+                .map_err(|_| Error::StructuredOutput)
+                .and_then(|generated| {
+                    if generated.is_object() {
+                        Ok(generated)
+                    } else {
+                        Err(Error::StructuredOutput)
+                    }
+                })
+                .and_then(|generated| match schema.validate(&generated) {
+                    Ok(()) => Ok(generated),
+                    Err(error) => Err(Error::Validation {
+                        instance_path: error.instance_path.to_string(),
+                        schema_path: error.schema_path.to_string(),
+                    }),
+                });
+            match structured {
+                Ok(generated) => {
+                    return Ok(Generated {
+                        value: generated,
+                        prompt_hash: blake3::hash(prompt.as_bytes()).to_hex().to_string(),
+                        model: response.model,
+                        attempts,
+                    });
+                }
+                Err(error) if regenerations < regenerate_on_invalid => {
+                    regenerations += 1;
+                    statistics.regeneration_attempts_total += 1;
+                    feedback = Some(repair_feedback(&error));
+                }
+                Err(error) => {
+                    if matches!(error, Error::StructuredOutput) {
+                        statistics.structured_output_failed_total += 1;
+                    } else {
+                        statistics.validation_failed_total += 1;
+                    }
+                    return Err(error);
+                }
+            }
         }
-        if let Err(error) = schema.validate(&generated) {
-            statistics.validation_failed_total += 1;
-            return Err(Error::Validation {
-                instance_path: error.instance_path.to_string(),
-                schema_path: error.schema_path.to_string(),
-            });
-        }
-        Ok(Generated {
-            value: generated,
-            prompt_hash: blake3::hash(prompt.as_bytes()).to_hex().to_string(),
-            model: response.model,
-            attempts: response.attempts,
-        })
     }
     .await;
     Outcome {
@@ -292,5 +327,19 @@ async fn process(
         result,
         statistics,
         attempts,
+    }
+}
+
+/// Diagnostics sent back to the provider describe rule paths, never raw output.
+fn repair_feedback(error: &Error) -> String {
+    match error {
+        Error::StructuredOutput => "the reply was not a valid JSON object".to_owned(),
+        Error::Validation {
+            instance_path,
+            schema_path,
+        } => {
+            format!("schema validation failed at {instance_path} (rule {schema_path})")
+        }
+        other => other.to_string(),
     }
 }

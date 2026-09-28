@@ -593,6 +593,7 @@ async fn provider_semaphore_limits_callers_outside_the_engine() {
             GenerateRequest {
                 prompt: "test",
                 record: &data,
+                feedback: None,
             },
             &cancellation,
         )
@@ -636,6 +637,7 @@ async fn provider_backoff_is_cancellable() {
             GenerateRequest {
                 prompt: "test",
                 record: &data,
+                feedback: None,
             },
             &token,
         ),
