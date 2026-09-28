@@ -2,7 +2,7 @@ use crate::{
     Error, Result,
     spec::{MAX_RECORD_BYTES, SourceConfig, validate_input},
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{
     fs::File,
     io::{BufRead, BufReader, Read},
@@ -21,6 +21,11 @@ enum Input<'a> {
         reader: BufReader<File>,
         path: PathBuf,
     },
+    Csv {
+        reader: csv::Reader<File>,
+        headers: csv::StringRecord,
+        record: csv::StringRecord,
+    },
 }
 
 impl<'a> Source<'a> {
@@ -31,6 +36,27 @@ impl<'a> Source<'a> {
                 reader: BufReader::new(File::open(path).map_err(|e| Error::io(path, e))?),
                 path: path.clone(),
             },
+            SourceConfig::Csv { path } => {
+                let mut reader = csv::ReaderBuilder::new()
+                    .flexible(false)
+                    .from_path(path)
+                    .map_err(|e| Error::Source {
+                        position: 0,
+                        message: format!("cannot open CSV source: {e}"),
+                    })?;
+                let headers = reader
+                    .headers()
+                    .map_err(|e| Error::Source {
+                        position: 0,
+                        message: format!("cannot read CSV header: {e}"),
+                    })?
+                    .clone();
+                Input::Csv {
+                    reader,
+                    headers,
+                    record: csv::StringRecord::new(),
+                }
+            }
         };
         Ok(Self {
             input,
@@ -65,6 +91,43 @@ impl Iterator for Source<'_> {
                         message: "invalid JSON (blank lines are not allowed)".into(),
                     })),
                     Err(e) => Some(Err(Error::io(path.clone(), e))),
+                }
+            }
+            Input::Csv {
+                reader,
+                headers,
+                record,
+            } => {
+                let position = self.position + 1;
+                match reader.read_record(record) {
+                    Ok(false) => None,
+                    Ok(true) => {
+                        let bytes =
+                            headers.iter().map(str::len).sum::<usize>() + record.as_slice().len();
+                        if bytes > MAX_RECORD_BYTES {
+                            Some(Err(Error::Source {
+                                position,
+                                message: "CSV row exceeds 8 MiB limit".into(),
+                            }))
+                        } else if record.len() != headers.len() {
+                            Some(Err(Error::Source {
+                                position,
+                                message: "CSV row does not match the header width".into(),
+                            }))
+                        } else {
+                            // Every value arrives as a string; duplicate
+                            // headers keep the last occurrence.
+                            let mut map = Map::new();
+                            for (header, value) in headers.iter().zip(record.iter()) {
+                                map.insert(header.to_owned(), Value::String(value.to_owned()));
+                            }
+                            Some(Ok(Value::Object(map)))
+                        }
+                    }
+                    Err(e) => Some(Err(Error::Source {
+                        position,
+                        message: format!("CSV parse failed: {e}"),
+                    })),
                 }
             }
         };

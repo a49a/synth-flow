@@ -75,7 +75,7 @@ pub fn fingerprint(source: &SourceConfig, cancellation: &CancellationToken) -> R
                     .as_bytes(),
             );
         }
-        SourceConfig::Jsonl { path } => {
+        SourceConfig::Jsonl { path } | SourceConfig::Csv { path } => {
             let mut file = File::open(path).map_err(|e| Error::io(path, e))?;
             let mut buffer = [0u8; 65536];
             loop {

@@ -41,6 +41,7 @@ pub struct Dataset {
 pub enum SourceConfig {
     Inline { records: Vec<Value> },
     Jsonl { path: PathBuf },
+    Csv { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -227,7 +228,7 @@ impl Pipeline {
             Error::Configuration(format!("{}: {detail}{location}", e.path()))
         })?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
-        if let SourceConfig::Jsonl { path } = &mut spec.source {
+        if let SourceConfig::Jsonl { path } | SourceConfig::Csv { path } = &mut spec.source {
             *path = normalize_path(&base.join(&*path))?;
         }
         spec.output.path = normalize_path(&base.join(&spec.output.path))?;
@@ -394,6 +395,11 @@ impl Pipeline {
                     return Err(invalid("JSONL source path must refer to an existing file"));
                 }
             }
+            SourceConfig::Csv { path } => {
+                if !path.is_file() {
+                    return Err(invalid("CSV source path must refer to an existing file"));
+                }
+            }
         }
         if self.output.path.file_name().is_none() || self.output.path.is_dir() {
             return Err(invalid("output.path must name a file"));
@@ -429,7 +435,8 @@ impl Pipeline {
                     "output, partial, manifest and dead-letter paths must be distinct",
                 ));
             }
-            if let SourceConfig::Jsonl { path: source } = &self.source
+            if let SourceConfig::Jsonl { path: source } | SourceConfig::Csv { path: source } =
+                &self.source
                 && *path == normalize_path(source)?
             {
                 return Err(invalid("run artifacts must not overwrite the source"));
@@ -521,7 +528,7 @@ impl Pipeline {
         let mut canonical = self.clone();
         canonical.output.path = normalize_path(&self.output.path)?;
         canonical.errors.dead_letter = Some(self.dead_letter_path()?);
-        if let SourceConfig::Jsonl { path } = &mut canonical.source {
+        if let SourceConfig::Jsonl { path } | SourceConfig::Csv { path } = &mut canonical.source {
             *path = normalize_path(path)?;
         }
         let value = serde_json::to_value(canonical)
@@ -535,6 +542,7 @@ impl Pipeline {
         let source = match self.source {
             SourceConfig::Inline { .. } => "InlineSource",
             SourceConfig::Jsonl { .. } => "JsonlSource",
+            SourceConfig::Csv { .. } => "CsvSource",
         };
         let regenerate = if self.generate.regenerate_on_invalid > 0 {
             format!(

@@ -1,0 +1,29 @@
+version: 1
+dataset:
+  name: csv_seeds
+source:
+  type: csv
+  path: topics.csv
+providers:
+  generator:
+    type: mock
+    response: |
+      {
+        "question": {{ ("Explain Rust " ~ record.topic ~ ".") | tojson }},
+        "answer": {{ record.summary | tojson }}
+      }
+generate:
+  provider: generator
+  prompt: |
+    Create one Rust interview question about {{ record.topic }}.
+    Return JSON only.
+  output_schema:
+    type: object
+    additionalProperties: false
+    required: [question, answer]
+    properties:
+      question: {type: string, minLength: 1}
+      answer: {type: string, minLength: 1}
+output:
+  format: jsonl
+  path: output/csv_rust_instruction.jsonl
