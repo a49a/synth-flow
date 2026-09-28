@@ -141,6 +141,32 @@ pub enum DedupConfig {
         #[serde(default)]
         normalize: Normalize,
     },
+    #[serde(rename = "minhash")]
+    MinHash {
+        /// Dotted path to the text field compared for near duplicates.
+        field: String,
+        #[serde(default = "default_num_perm")]
+        num_perm: u16,
+        #[serde(default = "default_bands")]
+        bands: u16,
+        #[serde(default = "default_threshold")]
+        threshold: f64,
+        #[serde(default = "default_shingle_words")]
+        shingle_words: usize,
+    },
+}
+
+fn default_num_perm() -> u16 {
+    128
+}
+fn default_bands() -> u16 {
+    16
+}
+fn default_threshold() -> f64 {
+    0.8
+}
+fn default_shingle_words() -> usize {
+    3
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
@@ -229,18 +255,48 @@ impl Pipeline {
         if self.generate.regenerate_on_invalid > 3 {
             return Err(invalid("generate.regenerate_on_invalid must be in 0..=3"));
         }
-        if let Some(dedup) = &self.dedup
-            && let DedupConfig::Exact {
-                fields: Some(fields),
-                ..
-            } = dedup
-            && fields.iter().any(|field| {
-                field.trim().is_empty() || field.split('.').any(|segment| segment.trim().is_empty())
-            })
-        {
-            return Err(invalid(
-                "dedup.fields entries must be non-empty dotted paths",
-            ));
+        let dotted = |field: &str| {
+            field.trim().is_empty() || field.split('.').any(|segment| segment.trim().is_empty())
+        };
+        match &self.dedup {
+            Some(DedupConfig::Exact { fields, .. }) => {
+                if fields
+                    .as_ref()
+                    .is_some_and(|fields| fields.iter().any(|field| dotted(field)))
+                {
+                    return Err(invalid(
+                        "dedup.fields entries must be non-empty dotted paths",
+                    ));
+                }
+            }
+            Some(DedupConfig::MinHash {
+                field,
+                num_perm,
+                bands,
+                threshold,
+                shingle_words,
+            }) => {
+                if dotted(field) {
+                    return Err(invalid("dedup.field must be a non-empty dotted path"));
+                }
+                if *num_perm < 8
+                    || *num_perm > 1024
+                    || *bands == 0
+                    || *bands > *num_perm
+                    || *num_perm % *bands != 0
+                {
+                    return Err(invalid(
+                        "dedup num_perm (8..=1024) must be divisible by bands (1..=num_perm)",
+                    ));
+                }
+                if !threshold.is_finite() || !(0.0..=1.0).contains(threshold) {
+                    return Err(invalid("dedup.threshold must be in 0..=1"));
+                }
+                if *shingle_words == 0 || *shingle_words > 10 {
+                    return Err(invalid("dedup.shingle_words must be in 1..=10"));
+                }
+            }
+            None => {}
         }
         if let Some(judge) = &self.judge {
             if !self.providers.contains_key(&judge.provider) {
@@ -493,10 +549,10 @@ impl Pipeline {
         } else {
             ""
         };
-        let dedup = if self.dedup.is_some() {
-            "\n  ↓\nDedup"
-        } else {
-            ""
+        let dedup = match &self.dedup {
+            Some(DedupConfig::Exact { .. }) => "\n  ↓\nDedupExact",
+            Some(DedupConfig::MinHash { .. }) => "\n  ↓\nDedupMinHash",
+            None => "",
         };
         format!(
             "{source}\n  ↓\nPromptRender\n  ↓\nGenerate({})\n  ↓\nJsonParse\n  ↓\nSchemaValidate{regenerate}{judge}{dedup}\n  ↓\nJsonlSink",
