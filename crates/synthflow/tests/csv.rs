@@ -77,3 +77,52 @@ fn missing_csv_file_fails_validation() {
     let spec = fixture(&dir, dir.path().join("absent.csv"));
     assert!(spec.validate().is_err());
 }
+
+#[test]
+fn duplicate_and_empty_headers_are_rejected() {
+    for text in ["topic,topic\na,b\n", "topic,\na,b\n", "topic,  \na,b\n"] {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("input.csv");
+        fs::write(&path, text).unwrap();
+        assert!(
+            run(&fixture(&dir, path))
+                .unwrap_err()
+                .to_string()
+                .contains("headers")
+        );
+    }
+}
+
+#[test]
+fn multiline_fields_and_missing_final_newline_are_preserved() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("input.csv");
+    fs::write(&path, "topic,summary\r\na,\"line one\nline two\"\r\nb,tail").unwrap();
+    let spec = fixture(&dir, path);
+    run(&spec).unwrap();
+    let result = rows(&spec);
+    assert_eq!(result[0]["summary"], "line one\nline two");
+    assert_eq!(result[1]["summary"], "tail");
+}
+
+#[test]
+fn oversized_headers_and_records_fail_safely() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("input.csv");
+    let large = "x".repeat(synthflow::spec::MAX_RECORD_BYTES + 1);
+    for body in [format!("{large}\n"), format!("topic\n{large}\n")] {
+        fs::write(&path, body).unwrap();
+        let config = synthflow::spec::SourceConfig::Csv { path: path.clone() };
+        match synthflow::source::Source::open(&config) {
+            Err(error) => assert!(error.to_string().contains("8 MiB")),
+            Ok(mut source) => assert!(
+                source
+                    .next()
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("8 MiB")
+            ),
+        }
+    }
+}
