@@ -1,5 +1,6 @@
 use crate::{
     Error, Pipeline, Result,
+    dedup::DedupState,
     provider::{GenerateRequest, LlmProvider, ProviderStatistics, create_provider},
     record::{RecordMeta, record_id},
     run::{Artifacts, RunReport, RunStatus, fingerprint, now_ms, save_report},
@@ -106,6 +107,7 @@ pub async fn run_with_provider(
     env.add_template("generate", &pipeline.generate.prompt)
         .map_err(|_| Error::Configuration("invalid generation template".into()))?;
     let judge = build_judge(pipeline)?;
+    let mut dedup = pipeline.dedup.as_ref().map(DedupState::new);
     let source_hash = source_fingerprint(pipeline, &cancellation).await?;
     let mut source = Source::open(&pipeline.source)?;
     let (mut artifacts, mut report) = Artifacts::create(pipeline, source_hash)?;
@@ -152,31 +154,45 @@ pub async fn run_with_provider(
             let id = record_id(&input, outcome.position);
             let rejected = match outcome.result {
                 Ok(generated) => {
-                    let meta = RecordMeta {
-                        record_id: id, run_id: report.run_id.clone(), source_position: outcome.position,
-                        pipeline_hash: report.pipeline_hash.clone(), pipeline_version: pipeline.version,
-                        source_fingerprint: report.source_fingerprint.clone(),
-                        stage: "accepted", attempt: generated.attempts, generator_provider: pipeline.generate.provider.clone(), generator_model: generated.model,
-                        prompt_hash: generated.prompt_hash, template_engine: "minijinja/2",
-                        judge_provider: generated.judge.as_ref().map(|j| j.provider.clone()),
-                        judge_model: generated.judge.as_ref().map(|j| j.model.clone()),
-                        judge_score: generated.judge.as_ref().map(|j| j.score),
-                    };
                     if let Some(judge) = &generated.judge {
                         input.insert("judge".into(), json!({"provider": judge.provider, "model": judge.model, "score": judge.score}));
                     }
                     input.insert("generated".into(), generated.value);
-                    input.insert("_meta".into(), serde_json::to_value(meta).map_err(|_| Error::Sink("metadata serialization failed".into()))?);
-                    artifacts.write_accepted(&Value::Object(input))?;
-                    report.statistics.accepted_records_total += 1;
-                    false
+                    // Dedup keys cover input plus generated; metadata is per-run.
+                    let verdict = match &mut dedup {
+                        Some(state) => state
+                            .insert(&Value::Object(input.clone()))
+                            .and_then(|duplicate| if duplicate { Err(Error::Duplicate) } else { Ok(()) }),
+                        None => Ok(()),
+                    };
+                    match verdict {
+                        Ok(()) => {
+                            let meta = RecordMeta {
+                                record_id: id, run_id: report.run_id.clone(), source_position: outcome.position,
+                                pipeline_hash: report.pipeline_hash.clone(), pipeline_version: pipeline.version,
+                                source_fingerprint: report.source_fingerprint.clone(),
+                                stage: "accepted", attempt: generated.attempts, generator_provider: pipeline.generate.provider.clone(), generator_model: generated.model,
+                                prompt_hash: generated.prompt_hash, template_engine: "minijinja/2",
+                                judge_provider: generated.judge.as_ref().map(|j| j.provider.clone()),
+                                judge_model: generated.judge.as_ref().map(|j| j.model.clone()),
+                                judge_score: generated.judge.as_ref().map(|j| j.score),
+                            };
+                            input.insert("_meta".into(), serde_json::to_value(meta).map_err(|_| Error::Sink("metadata serialization failed".into()))?);
+                            artifacts.write_accepted(&Value::Object(input))?;
+                            report.statistics.accepted_records_total += 1;
+                            false
+                        }
+                        Err(error) => {
+                            if matches!(error, Error::Duplicate) {
+                                report.statistics.duplicate_records_total += 1;
+                            }
+                            write_rejection(&mut artifacts, &mut report, &id, outcome.position, &error, outcome.attempts)?;
+                            true
+                        }
+                    }
                 }
                 Err(error) => {
-                    let mut diagnostic = error.diagnostic();
-                    diagnostic.attempts = diagnostic.attempts.max(outcome.attempts);
-                    artifacts.write_rejected(&json!({"run_id":report.run_id, "record_id":id, "source_position":outcome.position, "diagnostic":diagnostic}))?;
-                    report.statistics.rejected_records_total += 1;
-                    tracing::warn!(position = outcome.position, category = error.diagnostic().category, event = "record_rejected");
+                    write_rejection(&mut artifacts, &mut report, &id, outcome.position, &error, outcome.attempts)?;
                     true
                 }
             };
@@ -228,6 +244,31 @@ pub async fn run_with_provider(
         );
     }
     Ok(report)
+}
+
+fn write_rejection(
+    artifacts: &mut Artifacts,
+    report: &mut RunReport,
+    id: &str,
+    position: u64,
+    error: &Error,
+    attempts: u32,
+) -> Result<()> {
+    let mut diagnostic = error.diagnostic();
+    diagnostic.attempts = diagnostic.attempts.max(attempts);
+    artifacts.write_rejected(&json!({
+        "run_id": report.run_id,
+        "record_id": id,
+        "source_position": position,
+        "diagnostic": diagnostic,
+    }))?;
+    report.statistics.rejected_records_total += 1;
+    tracing::warn!(
+        position,
+        category = diagnostic.category,
+        event = "record_rejected"
+    );
+    Ok(())
 }
 
 fn refresh(report: &mut RunReport, started: Instant, provider: &dyn LlmProvider) {

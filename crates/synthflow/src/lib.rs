@@ -1,4 +1,5 @@
 //! Local, streaming synthetic-data pipelines. Reliable streaming execution with mock and HTTP providers.
+pub mod dedup;
 pub mod engine;
 pub mod error;
 pub mod provider;

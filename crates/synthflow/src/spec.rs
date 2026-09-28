@@ -23,6 +23,8 @@ pub struct Pipeline {
     pub generate: Generation,
     #[serde(default)]
     pub judge: Option<JudgeConfig>,
+    #[serde(default)]
+    pub dedup: Option<DedupConfig>,
     pub output: Output,
     #[serde(default)]
     pub errors: ErrorPolicy,
@@ -130,6 +132,26 @@ fn default_score_field() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DedupConfig {
+    Exact {
+        /// Dotted paths into input plus generated; defaults to the whole
+        /// generated object.
+        fields: Option<Vec<String>>,
+        #[serde(default)]
+        normalize: Normalize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Normalize {
+    #[default]
+    None,
+    Lowercase,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Output {
     pub format: OutputFormat,
@@ -206,6 +228,19 @@ impl Pipeline {
         }
         if self.generate.regenerate_on_invalid > 3 {
             return Err(invalid("generate.regenerate_on_invalid must be in 0..=3"));
+        }
+        if let Some(dedup) = &self.dedup
+            && let DedupConfig::Exact {
+                fields: Some(fields),
+                ..
+            } = dedup
+            && fields.iter().any(|field| {
+                field.trim().is_empty() || field.split('.').any(|segment| segment.trim().is_empty())
+            })
+        {
+            return Err(invalid(
+                "dedup.fields entries must be non-empty dotted paths",
+            ));
         }
         if let Some(judge) = &self.judge {
             if !self.providers.contains_key(&judge.provider) {
@@ -458,8 +493,13 @@ impl Pipeline {
         } else {
             ""
         };
+        let dedup = if self.dedup.is_some() {
+            "\n  ↓\nDedup"
+        } else {
+            ""
+        };
         format!(
-            "{source}\n  ↓\nPromptRender\n  ↓\nGenerate({})\n  ↓\nJsonParse\n  ↓\nSchemaValidate{regenerate}{judge}\n  ↓\nJsonlSink",
+            "{source}\n  ↓\nPromptRender\n  ↓\nGenerate({})\n  ↓\nJsonParse\n  ↓\nSchemaValidate{regenerate}{judge}{dedup}\n  ↓\nJsonlSink",
             self.generate.provider
         )
     }
