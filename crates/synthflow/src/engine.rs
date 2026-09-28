@@ -46,6 +46,8 @@ pub struct RunStatistics {
     pub records_per_second: f64,
     #[serde(default)]
     pub latency: LatencySummary,
+    #[serde(default)]
+    pub latency_calls_total: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
     pub provider_usage: ProviderStatistics,
@@ -126,8 +128,8 @@ mod latency_tests {
     }
 }
 
-/// Generation wall-clock percentiles in milliseconds over accepted and
-/// rejected calls alike; zeros when nothing reached a provider.
+/// Wall-clock percentiles over completed generation and judge calls, including
+/// failures and regeneration. In-flight calls dropped on cancellation are absent.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct LatencySummary {
     pub mean_ms: f64,
@@ -446,8 +448,8 @@ async fn execute(
             if matches!(outcome.result, Err(Error::Cancelled)) { return Err(Error::Cancelled); }
             report.statistics.merge(&outcome.statistics);
             report.statistics.processed_records_total += 1;
-            if outcome.latency_ms > 0.0 {
-                latencies.observe(outcome.latency_ms);
+            for latency in outcome.latencies_ms {
+                latencies.observe(latency);
             }
             let mut input = outcome.data.as_object().cloned().ok_or_else(|| Error::Source { position: outcome.position, message: "expected object".into() })?;
             let id = record_id(&input, outcome.position);
@@ -557,6 +559,7 @@ async fn execute(
     refresh(&mut report, started, provider.as_ref(), pipeline);
     // Percentiles are computed once at report time, never per record.
     report.statistics.latency = latencies.summary();
+    report.statistics.latency_calls_total = latencies.count;
     report.finished_at_unix_ms = Some(now_ms());
     let result = result.and_then(|()| artifacts.publish(&mut report));
     if let Err(error) = result {
@@ -699,7 +702,7 @@ struct Outcome {
     result: Result<Generated>,
     statistics: RunStatistics,
     attempts: u32,
-    latency_ms: f64,
+    latencies_ms: Vec<f64>,
 }
 struct StageTools<'a> {
     env: &'a minijinja::Environment<'a>,
@@ -716,7 +719,7 @@ async fn process(
 ) -> Outcome {
     let mut statistics = RunStatistics::default();
     let mut attempts = 0;
-    let mut latency_ms = 0.0f64;
+    let mut latencies_ms = Vec::new();
     let result = async {
         let mut context = data.as_object().cloned().unwrap_or_default();
         context.insert("record".into(), data.clone());
@@ -740,11 +743,11 @@ async fn process(
                     },
                     cancellation,
                 )
-                .await
-                .inspect_err(|_| {
-                    statistics.generation_failed_total += 1;
-                })?;
-            latency_ms += call.elapsed().as_secs_f64() * 1000.0;
+                .await;
+            latencies_ms.push(call.elapsed().as_secs_f64() * 1000.0);
+            let response = response.inspect_err(|_| {
+                statistics.generation_failed_total += 1;
+            })?;
             statistics.prompt_tokens_total += response.prompt_tokens.unwrap_or(0);
             statistics.completion_tokens_total += response.completion_tokens.unwrap_or(0);
             statistics.generation_success_total += 1;
@@ -773,6 +776,7 @@ async fn process(
                         &data,
                         tools.judge,
                         &mut statistics,
+                        &mut latencies_ms,
                         cancellation,
                     )
                     .await?;
@@ -807,7 +811,7 @@ async fn process(
         result,
         statistics,
         attempts,
-        latency_ms,
+        latencies_ms,
     }
 }
 
@@ -831,6 +835,7 @@ async fn judge_record(
     data: &Value,
     judge: Option<&JudgeTools>,
     statistics: &mut RunStatistics,
+    latencies_ms: &mut Vec<f64>,
     cancellation: &CancellationToken,
 ) -> Result<Option<Judged>> {
     let Some(tools) = judge else {
@@ -839,6 +844,7 @@ async fn judge_record(
     statistics.judge_requests_total += 1;
     let context = json!({"record": data, "generated": generated, "prompt": prompt});
     let prompt = template::render(&tools.env, "judge", &context)?;
+    let call = Instant::now();
     let response = tools
         .provider
         .generate(
@@ -850,10 +856,11 @@ async fn judge_record(
             },
             cancellation,
         )
-        .await
-        .inspect_err(|_| {
-            statistics.judge_failed_total += 1;
-        })?;
+        .await;
+    latencies_ms.push(call.elapsed().as_secs_f64() * 1000.0);
+    let response = response.inspect_err(|_| {
+        statistics.judge_failed_total += 1;
+    })?;
     statistics.prompt_tokens_total += response.prompt_tokens.unwrap_or(0);
     statistics.completion_tokens_total += response.completion_tokens.unwrap_or(0);
     let verdict = serde_json::from_str::<Value>(&response.text)

@@ -18,10 +18,22 @@ struct SlowProvider {
 impl LlmProvider for SlowProvider {
     async fn generate(
         &self,
-        _request: GenerateRequest<'_>,
+        request: GenerateRequest<'_>,
         _cancellation: &CancellationToken,
     ) -> synthflow::Result<GenerateResponse> {
         tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        if request
+            .record
+            .get("fail")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(synthflow::Error::Provider {
+                kind: synthflow::error::ProviderErrorKind::Timeout,
+                status: None,
+                attempts: 1,
+            });
+        }
         Ok(GenerateResponse {
             text: r#"{"answer": "ok"}"#.into(),
             model: "slow".into(),
@@ -121,4 +133,34 @@ fn pricing_must_be_finite_and_non_negative() {
         Some(json!({"input_usd_per_mtok": 0.0, "output_usd_per_mtok": 2.0})),
     );
     assert!(spec.validate().is_ok());
+}
+
+#[tokio::test]
+async fn latency_counts_failed_calls_and_judge_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = fixture(&dir, json!([{"topic":"a","fail":true},{"topic":"b"}]), None);
+    spec.providers.insert(
+        "judge".into(),
+        serde_json::from_value(json!({"type":"mock","response":"{\"score\":1}"})).unwrap(),
+    );
+    spec.judge = Some(
+        serde_json::from_value(json!({"provider":"judge","prompt":"score","min_score":0.5}))
+            .unwrap(),
+    );
+    let report = run_with_provider(
+        &spec,
+        Arc::new(SlowProvider {
+            delay_ms: 20,
+            prompt_tokens: None,
+            completion_tokens: None,
+        }),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(report.succeeded(), "{:?}", report.errors);
+    assert_eq!(report.statistics.generation_failed_total, 1);
+    assert_eq!(report.statistics.judge_requests_total, 1);
+    assert_eq!(report.statistics.latency_calls_total, 3);
+    assert!(report.statistics.latency.mean_ms >= 10.0);
 }
