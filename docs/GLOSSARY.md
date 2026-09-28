@@ -7,8 +7,8 @@
 | 中文 | English | 本项目中的含义 / Meaning in this project |
 | --- | --- | --- |
 | 流水线 | Pipeline | 按约定阶段处理记录的过程 / A sequence of stages that processes records |
-| 数据源 | Source | inline 数组或 JSONL 文件 / Inline records or a JSONL file |
-| 输出端 | Sink | accepted/rejected JSONL 的写入逻辑 / Writing accepted/rejected JSONL |
+| 数据源 | Source | inline 数组、JSONL 或 CSV 文件 / Inline records, JSONL, or CSV files |
+| 输出端 | Sink | 已接受/拒绝记录的提交及 JSONL/Parquet 发布 / Committing accepted/rejected records and publishing JSONL/Parquet |
 | 数据契约 | Data contract | 字段与类型的明确约束 / Explicit field and type constraints |
 | 提供者 | Provider | mock 或 HTTP 模型调用边界 / Boundary around mock or HTTP model calls |
 | 结构化输出 | Structured output | 可以解析并接受 Schema 校验的内容 / Content that can be parsed and schema-validated |
@@ -17,7 +17,11 @@
 | 背压 | Backpressure | 下游变慢会限制上游继续接收数据 / Slower downstream work limits upstream admission |
 | 队头阻塞 | Head-of-line blocking | 后续已完成结果等待前面的慢结果 / Later completed results wait for an earlier slow result |
 | 信号量 | Semaphore | 控制同时进行的 HTTP 尝试数量 / Controlling simultaneous HTTP attempts |
-| 速率限制 | Rate limiting | 限制单位时间请求或 token 数，尚未实现 / Limiting requests or tokens per time unit; not yet implemented |
+| 速率限制 | Rate limiting | 60 秒滑动窗口限制 HTTP 请求数或 token 数；每次重试都计入 / A 60-second sliding window for HTTP requests or tokens; retries count individually |
+| 重新生成 | Regeneration | Schema 拒绝后将修复反馈交给 provider 再生成 / Calling the provider again with repair feedback after schema rejection |
+| 评判 | Judge | 第二次 provider 调用给生成内容评分并筛选 / A second provider call that scores and filters generated content |
+| 去重 | Deduplication | 在 sink 接受后登记精确或 MinHash 键 / Registering exact or MinHash keys after sink acceptance |
+| 恢复 | Resume | 校验失败/取消清单、源与配置后，从已提交前缀继续 / Continuing a failed/cancelled run from its committed prefix after source/config checks |
 | 指数退避 | Exponential backoff | 重试间隔随尝试次数增加，带上限 / Increasing retry intervals with a cap |
 | 抖动 | Jitter | 随机化等待时间以分散重试 / Randomized delay to spread retries |
 | 取消令牌 | Cancellation token | 共享取消信号 / Shared cancellation signal |
@@ -90,11 +94,11 @@
 
 **English**: No. Atomically replacing one directory entry does not commit accepted, rejected, and manifest files simultaneously. Interrupted publication needs explicit inspection and recovery.
 
-### 8. 已保存偏移，为什么还没有 resume？ / Why is resume absent despite saved offsets?
+### 8. 已保存偏移，resume 还需要检查什么？ / What must resume check beyond saved offsets?
 
-**中文**：偏移只是基础。还需要验证配置与源身份、处理未提交尾部、恢复计数与调度、解决 publishing 状态，以及用中断对比测试证明不会重复输出。
+**中文**：当前 `resume` 校验配置 hash 和源指纹，截断未提交尾部，恢复计数、去重状态及 Parquet Schema；输出命名空间使用跨进程锁，避免并发恢复。它只接受 failed/cancelled 清单，不自动处理 SIGKILL 留下的 running/publishing 状态。
 
-**English**: Offsets are only a foundation. Resume also needs source/config identity checks, uncommitted-tail handling, restored counters and scheduling, publishing-state recovery, and interruption comparisons proving output is not duplicated.
+**English**: Current `resume` checks the configuration hash and source fingerprint, truncates uncommitted tails, and restores counters, deduplication state, and the Parquet schema. A cross-process namespace lock prevents concurrent resume. It accepts failed/cancelled manifests only; running/publishing states left by SIGKILL are not recovered automatically.
 
 ## 常见误区 / Common misconceptions
 

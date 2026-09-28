@@ -8,8 +8,8 @@
 
 | 文档 / Document | 内容 / Contents |
 | --- | --- |
-| [概念与源码导读 / Concepts and code walkthrough](TEACHING_GUIDE.md) | 10 章：数据流、Rust 边界、校验、异步、持久化与测试 / Ten chapters on data flow, Rust boundaries, validation, async execution, persistence, and testing |
-| [实验手册 / Lab workbook](LABS.md) | 8 个实验，含预期结果与参考解释 / Eight labs with expected results and explanations |
+| [概念与源码导读 / Concepts and code walkthrough](TEACHING_GUIDE.md) | 数据流、Rust 边界、校验、恢复、去重与测试 / Data flow, Rust boundaries, validation, resume, deduplication, and testing |
+| [实验手册 / Lab workbook](LABS.md) | 9 个实验，含预期结果与参考解释 / Nine labs with expected results and explanations |
 | [术语与教师指南 / Glossary and instructor notes](GLOSSARY.md) | 中英术语、课堂安排、检查题与评分标准 / Bilingual terminology, lesson plans, review questions, and assessment |
 | [项目使用说明 / Project usage](../README.md) | 当前 CLI、配置及限制 / Current CLI, configuration, and limitations |
 | [设计目标 / Design goals](../SYNTHFLOW_DESIGN.md) | 长期蓝图，包含尚未实现的功能 / Long-term blueprint, including unimplemented features |
@@ -35,10 +35,10 @@
 
 **系统学习，约 4–6 小时 / Full study, about 4–6 hours**：完成全部导读、实验与检查题。 / Complete the guide, labs, and review questions.
 
-**进阶课程作业 / Advanced assignment**：从实验 8 选择一个扩展，先写验收条件，再修改代码并演示故障行为。 / Select an extension from lab 8, write acceptance criteria first, then implement it and demonstrate failure behavior.
+**进阶课程作业 / Advanced assignment**：先完成实验 8 的现有功能验证，再从实验 9 选择扩展，写出验收条件并演示故障行为。 / Verify current features in lab 8, then select an extension from lab 9, define acceptance criteria, and demonstrate failure behavior.
 
 ## 文档与实现的边界 / Documentation versus implementation
 
-**中文**：教材以当前仓库代码为准。已经实现 mock/HTTP provider、JSONL/inline 输入、Schema 校验、有界并发、重试、取消和持久化清单。CSV、judge、去重、Parquet、RPM/TPM 限流与自动 resume 尚未实现。设计文档中的完整架构图不是当前功能清单。
+**中文**：教材以当前仓库代码为准。已实现 JSONL/CSV/inline 输入、mock/HTTP provider、Schema 校验与重生成、judge、精确/MinHash 去重、JSONL/Parquet 输出、RPM/TPM 限流、显式 `resume`、指标和 `inspect`。`resume` 仅接受 failed/cancelled 清单；SIGKILL 后若清单仍为 running/publishing，需要人工检查。设计文档还包含未实现的长期目标。
 
-**English**: The teaching material describes the current repository. Mock/HTTP providers, JSONL/inline inputs, schema validation, bounded concurrency, retries, cancellation, and durable manifests are implemented. CSV, judging, deduplication, Parquet, RPM/TPM limiting, and automatic resume are not. The full architecture in the design document is not a list of currently available features.
+**English**: These materials describe the current repository. It implements JSONL/CSV/inline sources, mock/HTTP providers, schema validation and regeneration, judging, exact/MinHash deduplication, JSONL/Parquet output, RPM/TPM limiting, explicit `resume`, metrics, and `inspect`. Resume accepts failed/cancelled manifests only; a running/publishing manifest left by SIGKILL needs manual inspection. The design document also contains longer-term goals.

@@ -17,7 +17,7 @@ cargo build --workspace
 cargo run -q -p synthflow-cli -- --help
 ```
 
-**预期 / Expected**：help 包含 validate、plan、run；当前没有 resume 或 inspect 子命令。 / Help lists validate, plan, and run; resume and inspect are not implemented commands.
+**预期 / Expected**：help 包含 validate、plan、run、resume 和 inspect。 / Help lists validate, plan, run, resume, and inspect.
 
 ## 实验 1：观察完整数据流 / Lab 1: Observe the complete data flow
 
@@ -234,9 +234,40 @@ cargo test -p synthflow --test reliability publish_race_never_clobbers_another_w
 
 **思考 / Think**：如果 partial 比 manifest.accepted_bytes 长，恢复程序能否直接把整个文件当作已提交结果？ / If partial is longer than manifest.accepted_bytes, can recovery treat the whole file as committed?
 
-**参考 / Reference**：不能。超出部分可能处于未提交窗口；需要明确的恢复协议校验并处理尾部，当前项目尚未实现该协议。 / No. The extra bytes can belong to an uncommitted window. A recovery protocol must validate and handle that tail; the project does not implement one yet.
+**参考 / Reference**：不能。超出部分可能处于未提交窗口；当前 `resume` 只接受 failed/cancelled 清单，并将 partial 和 dead-letter 截断到清单记录的已提交字节数。SIGKILL 后若清单仍为 running/publishing，不能直接运行 `resume`。 / No. Extra bytes can be uncommitted. Current `resume` accepts failed/cancelled manifests and truncates partial/dead-letter files to committed byte counts. A running/publishing manifest left by SIGKILL cannot be resumed directly.
 
-## 实验 8：设计并实现一个扩展 / Lab 8: Design and implement an extension
+## 实验 8：验证已实现的高级功能 / Lab 8: Verify implemented advanced features
+
+**目标 / Goal**：用已有回归测试观察 CSV、重生成、限流、judge、去重、Parquet、恢复和 inspect 的行为。 / Use existing regression tests to observe CSV, regeneration, rate limiting, judging, deduplication, Parquet, resume, and inspect.
+
+```bash
+cargo test -p synthflow --test csv csv_source_handles_quotes_and_crlf_and_keeps_strings -- --exact
+cargo test -p synthflow --test regeneration invalid_then_valid_output_is_repaired_and_accepted -- --exact
+cargo test -p synthflow --test ratelimit every_retry_passes_the_request_rate_limit -- --exact
+cargo test -p synthflow --test judge judge_scores_generated_records_and_appends_evidence -- --exact
+cargo test -p synthflow --test dedup exact_duplicates_are_rejected_in_commit_order -- --exact
+cargo test -p synthflow --test minhash near_duplicate_answers_are_deduplicated_end_to_end -- --exact
+cargo test -p synthflow --test remediation parquet_resume_keeps_the_original_schema_constraints -- --exact
+cargo test -p synthflow --test remediation concurrent_resumes_allow_exactly_one_writer -- --exact
+cargo test -p synthflow --test inspect mixed_types_and_unsupported_extensions_are_reported -- --exact
+```
+
+**预期 / Expected**：各命令运行一个测试并通过。观察拒绝类别与已提交条数，并解释为什么 Parquet Schema 和去重状态必须跨 resume 保持一致。 / Each command runs one passing test. Inspect rejection categories and committed counts, then explain why the Parquet schema and deduplication state must survive resume unchanged.
+
+**动手使用 inspect / Try inspect**：用独立临时目录生成数据，再查看统计。 / Generate data in a separate temporary directory, then inspect its statistics.
+
+```bash
+LAB_DIR="$(mktemp -d)"
+cp examples/reliable_generation.yaml "$LAB_DIR/pipeline.yaml"
+cargo run -q -p synthflow-cli -- run "$LAB_DIR/pipeline.yaml" > "$LAB_DIR/report.json"
+cargo run -q -p synthflow-cli -- inspect "$LAB_DIR/output/reliable_demo.jsonl" --json
+```
+
+**讨论 / Discuss**：混合类型列中的非数值项能否参与数值均值的分母？ / Should non-numeric values in a mixed column contribute to the numeric mean's denominator?
+
+**参考 / Reference**：不能。当前实现仅用数值项计算 min/max/mean；没有数值项时 mean 为 null。 / No. The implementation calculates min/max/mean from numeric values only; mean is null when there are no numeric values.
+
+## 实验 9：设计并实现一个扩展 / Lab 9: Design and implement an extension
 
 **中文**：任选一项。先提交设计说明，再修改代码。以下均为学生作业，不是当前已有功能。
 
@@ -244,10 +275,9 @@ cargo test -p synthflow --test reliability publish_race_never_clobbers_another_w
 
 | 作业 / Assignment | 要回答的问题 / Design question | 验收要求 / Acceptance criteria |
 | --- | --- | --- |
-| CSV source | 空值、列类型、重复表头怎么处理？ / How are nulls, types, and duplicate headers handled? | 流式读取，稳定位置，类型规则文档化，含引号和空行测试 / Streaming reads, stable positions, documented typing, quoted-field and blank-line tests |
-| RPM 限流 / RPM limiter | 与 semaphore、重试和取消怎样配合？ / How does it interact with semaphores, retries, and cancellation? | 使用可控时间测试速率；等待可取消；明确每次重试是否计入 / Controlled-time rate tests, cancellable waits, explicit retry accounting |
 | 批量提交 / Batched commits | 吞吐提升会扩大多大的未提交窗口？ / How much does higher throughput enlarge the uncommitted window? | 正常结束 flush 尾批；故障测试证明清单不引用未同步数据 / Flush the final batch; fault tests prove manifests never refer to unsynchronized data |
-| Resume 设计 / Resume design | 如何恢复偏移、统计和输出，避免重复？ / How are offsets, counters, and output restored without duplicates? | 明确源/配置匹配、尾部处理与发布状态恢复；对比中断与连续运行逻辑输出 / Specify source/config matching, tail handling, and publication recovery; compare interrupted and uninterrupted logical output |
+| 崩溃状态恢复 / Crash-state recovery | 如何安全处理 SIGKILL 留下的 running/publishing 清单？ / How can a running/publishing manifest left by SIGKILL be recovered safely? | 校验锁与目录项，测试发布中断及连续/恢复输出一致 / Check locks and directory entries; test publication interruption and output equivalence |
+| SQL 查询 / SQL querying | 如何在 JSONL/Parquet 上限制查询资源？ / How should queries over JSONL/Parquet be bounded? | 查询结果正确，错误可诊断，避免无界内存 / Correct results, diagnosable errors, bounded memory |
 
 **中文**：验收材料应包含：问题、状态或数据模型、失败窗口、测试命令、已知限制。只有性能数字而没有正确性依据，不能证明扩展完成。
 
@@ -258,7 +288,7 @@ cargo test -p synthflow --test reliability publish_race_never_clobbers_another_w
 - 能解释实验 1 为何整体成功、实验 2 为何整体失败。 / Explain why lab 1 succeeds and lab 2 fails.
 - 能定位一条记录的 ID、Schema 错误路径和提交位置。 / Locate a record ID, schema error path, and commit position.
 - 能说明重试与重新生成、并发限制与速率限制的区别。 / Distinguish retry from regeneration and concurrency from rate limiting.
-- 能说明当前为什么还不能宣称支持自动 resume。 / Explain why automatic resume is not yet supported.
+- 能说明 `resume` 的适用状态、检查点与锁，以及为什么 SIGKILL 后仍可能需要人工检查。 / Explain resume's allowed states, checkpoint and lock, and why SIGKILL can still require manual inspection.
 
 ```bash
 cargo fmt --all -- --check

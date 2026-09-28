@@ -75,8 +75,9 @@ synthflow resume examples/simple_generation.yaml
 `resume` 从 manifest 记录的 checkpoint 续跑上次 `failed` 或 `cancelled` 的运行：
 
 - 校验 pipeline 配置 hash、源文件指纹与 manifest 一致，manifest 状态必须是 `failed`/`cancelled`；`completed` 或正在运行的清单会拒绝。
+- 输出路径对应的 `.lock` 文件提供跨进程独占锁，防止多个 run/resume 同时修改同一检查点。
 - partial 与 dead-letter 截断到 manifest 记录的提交字节前缀后追加写入；崩溃遗留的尾部被丢弃。
-- 已配置去重时，dedup 状态从已提交前缀的记录重建，跨运行边界的重复依然会被拒绝。
+- 已配置去重时，dedup 状态从已提交前缀的记录重建；Parquet 的首条已接受记录也用于重建原 Schema，保持恢复前后的验收规则一致。
 - 已提交的源位置直接跳过；续跑后的正式输出恰好包含每条记录一次。
 - 新 manifest 记录 `resumed_from`（前次 run ID 与已提交数量）；失败策略按全数据集（含继承前缀）计算。报告统计只统计本次运行新处理的记录。
 
@@ -116,7 +117,7 @@ providers:
 - `timeout_ms` 覆盖每次 HTTP 请求和响应体读取；等待并发许可与重试退避不计入单次超时。
 - `Retry-After` 支持秒数和 HTTP 日期；当前等待上限仍由 `max_delay_ms` 限制。
 - `max_attempts` 包含首次请求；配置范围为 1–100，并发范围为 1–1024。
-- `rate_limit` 是 60 秒滑动窗口：RPM 按请求计；TPM 按请求前的 prompt 长度估算预留，响应返回真实 usage 后修正。限流等待发生在 semaphore 与退避之前，被取消的请求只浪费自己的预留。
+- `rate_limit` 是 60 秒滑动窗口：RPM 按每次 HTTP 尝试计，重试也占用配额；TPM 按每次请求前的 prompt 长度估算预留，响应返回真实 usage 后修正。每次尝试在取得 semaphore 前等待限流，被取消的请求只浪费自己的预留。
 - `provider_usage` 记录实际请求数、重试数、已返回的 prompt/completion tokens 和已完成 HTTP 尝试的累计耗时。取消请求可能已产生服务端费用，但未返回 usage，不能据此推断实际账单。
 
 Mock 使用 `type: mock` 和 `response` 模板，可选 `concurrency`，默认 1。上下文为 `record`、渲染后的 `prompt`、`prompt_hash`、`feedback`（重生成时的修复说明）和 `generated`（作为 judge 时的被评对象）；将字符串插入 JSON 时使用 `tojson`。mock 的生成内容和记录 ID 保持确定性，每次独立执行的 run ID 不同。
@@ -199,7 +200,7 @@ errors:
 
 ### 指标与成本
 
-- 报告包含生成调用的延迟摘要：`latency.mean_ms / p50_ms / p95_ms / p99_ms`（覆盖生成、重生成和 judge 的每次 provider 调用）。
+- 报告包含按记录累计成功生成调用耗时的摘要：`latency.mean_ms / p50_ms / p95_ms / p99_ms`。均值为增量计算；分位数来自最多 4096 个均匀蓄水池样本，超过该数量时为近似值。当前延迟口径不包含失败调用或 judge 调用。
 - `prompt_tokens_total` / `completion_tokens_total` 为引擎视角的全部 provider 调用（含 judge）返回的 usage 之和；mock 不返回 usage。
 - 可选 `pricing: {input_usd_per_mtok: 10.0, output_usd_per_mtok: 20.0}` 将其换算为 `estimated_cost_usd`（估算值，未含被取消请求的服务端费用）。
 - 运行期间每 500 条或 2 秒记录一次 progress 日志事件（processed/accepted/rejected/rate）。
@@ -211,7 +212,7 @@ synthflow inspect output/data.jsonl          # 可读表格
 synthflow inspect output/data.parquet --json # 完整 JSON 摘要
 ```
 
-统计行数、字节数和每个顶层列的类型、非空/空值计数（缺失键计为空值）、数值列的 min/max/mean 以及上限一百万的去重基数。SQL 查询（DataFusion）暂未实现。
+统计行数、字节数和每个顶层列的类型、非空/空值计数（缺失键计为空值）、数值列的 min/max/mean 以及上限一百万的去重基数。混合类型列只用数值项计算 min/max/mean；没有数值项时均值为 null。SQL 查询（DataFusion）暂未实现。
 
 ## 库与架构
 
