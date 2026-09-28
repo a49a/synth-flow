@@ -334,27 +334,32 @@ impl LlmProvider for OpenAiProvider {
             biased;
             _ = cancellation.cancelled() => Err(Error::Cancelled),
             result = async {
-                // Rate limits reserve before the semaphore and backoff; a
-                // cancelled or failed call only wastes its own reservation.
                 let token_estimate = estimate_tokens(request.prompt);
-                let admission = [
-                    self.rpm.as_ref().map(|limiter| limiter.reserve(1)),
-                    self.tpm.as_ref().map(|limiter| limiter.reserve(token_estimate)),
-                ]
-                .into_iter()
-                .flatten()
-                .max();
-                if let Some(until) = admission {
-                    let now = tokio::time::Instant::now();
-                    if until > now {
-                        tracing::debug!(
-                            wait_ms = (until - now).as_millis() as u64,
-                            event = "rate_limit_wait"
-                        );
-                        tokio::time::sleep_until(until).await;
-                    }
-                }
                 for attempt in 1..=self.retry.max_attempts {
+                    // Every physical request, retries included, passes the
+                    // rate limit before it touches the semaphore or the wire;
+                    // a cancelled or failed attempt only wastes its own
+                    // reservation, never the window budget.
+                    let admission = [
+                        self.rpm.as_ref().map(|limiter| limiter.reserve(1)),
+                        self.tpm
+                            .as_ref()
+                            .map(|limiter| limiter.reserve(token_estimate)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .max();
+                    if let Some(until) = admission {
+                        let now = tokio::time::Instant::now();
+                        if until > now {
+                            tracing::debug!(
+                                attempt,
+                                wait_ms = (until - now).as_millis() as u64,
+                                event = "rate_limit_wait"
+                            );
+                            tokio::time::sleep_until(until).await;
+                        }
+                    }
                     let permit = self.permits.acquire().await.map_err(|_| Error::Cancelled)?;
                     self.metrics.requests.fetch_add(1, Ordering::Relaxed);
                     if attempt > 1 { self.metrics.retries.fetch_add(1, Ordering::Relaxed); }
