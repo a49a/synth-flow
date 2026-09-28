@@ -156,9 +156,9 @@ pub trait LlmProvider: Send + Sync {
 
 **English**: This design accepts head-of-line blocking in exchange for simple ordered commits. A separate semaphore inside the provider limits active HTTP attempts even when callers bypass the engine. The window controls memory and scheduling; the semaphore controls provider requests. They are different limits.
 
-**中文**：核心调度窗口的内存随并发数和单条数据大小增长；去重状态及恢复时重建的已接受行仍可能随总记录数增长。8 MiB 上限分别约束源行、模板输出和 HTTP 响应等，不代表每个在途记录的所有拷贝合计只占 8 MiB，也不代表严格的进程内存配额。inline 源仍整体加载。
+**中文**：核心调度窗口的内存随并发数和单条数据大小增长；去重索引仍随唯一记录数增长；恢复时逐行读取已接受前缀。8 MiB 上限分别约束源行、模板输出和 HTTP 响应等，不代表每个在途记录的所有拷贝合计只占 8 MiB，也不代表严格的进程内存配额。inline 源仍整体加载。
 
-**English**: The core scheduling window's memory grows with concurrency and record size; deduplication state and accepted rows rebuilt during resume can still grow with total record count. Separate 8 MiB limits apply to source lines, template output, HTTP responses, and related inputs; they are not a combined 8 MiB budget per record or a strict process memory quota. Inline sources are still loaded as a whole.
+**English**: The core scheduling window's memory grows with concurrency and record size; the dedup index still grows with unique record count, but resume reads accepted rows one at a time. Separate 8 MiB limits apply to source lines, template output, HTTP responses, and related inputs; they are not a combined 8 MiB budget per record or a strict process memory quota. Inline sources are still loaded as a whole.
 
 ## 7. 错误、重试和取消 / Errors, retries, and cancellation
 
@@ -196,9 +196,9 @@ write row → sync accepted + rejected → update sink_state
           → write/sync temporary manifest → replace manifest → sync directory
 ```
 
-**中文**：成功结束时，先记录 `publishing`，再用硬链接创建最终路径。硬链接创建在目标存在时会失败，避免普通覆盖式 rename 破坏并发写入者的数据。JSONL 直接链接 partial；Parquet 从 JSONL partial 转换到独立且已同步的 `.publishing` 文件，再链接它。完成状态持久化后清理中间文件。输出命名空间的 `.lock` 文件防止并发 run/resume 修改同一检查点。
+**中文**：成功结束时，先记录 `publishing`，再用硬链接创建最终路径。硬链接创建在目标存在时会失败，避免普通覆盖式 rename 破坏并发写入者的数据。JSONL 直接链接 partial；Parquet 从 JSONL partial 转换到独立且已同步的 `.synthflow-publish-*` 临时文件，再链接它。完成状态持久化后清理中间文件。输出命名空间的 `.lock` 文件防止并发 run/resume 修改同一检查点。
 
-**English**: Successful termination records `publishing`, then creates the final path through a hard link, which fails if the destination already exists. JSONL links its partial directly; Parquet converts the JSONL partial into an independent, synced `.publishing` file and links that. Intermediates are cleaned after completed status is durable. A `.lock` file for the output namespace prevents concurrent run/resume operations on one checkpoint.
+**English**: Successful termination records `publishing`, then creates the final path through a hard link, which fails if the destination already exists. JSONL links its partial directly; Parquet converts the JSONL partial into an independent, synced `.synthflow-publish-*` temporary file and links that. Intermediates are cleaned after completed status is durable. A `.lock` file for the output namespace prevents concurrent run/resume operations on one checkpoint.
 
 ```mermaid
 stateDiagram-v2
@@ -254,9 +254,9 @@ stateDiagram-v2
 | [faults.rs](../crates/synthflow-cli/tests/faults.rs) | 子进程、鉴权、信号和强制终止 / Subprocesses, authentication, signals, forced termination |
 | [run.rs 内部测试 / Internal tests](../crates/synthflow/src/run.rs) | 可失败的 Write 接口 / A failing Write implementation |
 
-**中文**：故障注入不等于验证所有文件系统崩溃情形；本地 HTTP server 也不证明所有模型服务都兼容。显式 `resume` 可以从 failed/cancelled 清单的已提交前缀继续，但不自动接管 SIGKILL 留下的 running/publishing 清单，也不保证远端 provider 恰好执行一次。
+**中文**：故障注入不等于验证所有文件系统崩溃情形；本地 HTTP server 也不证明所有模型服务都兼容。显式 `resume` 在持有锁并校验源与配置后，可以恢复 failed/cancelled/running/publishing。已有正式文件须匹配预先保存的发布摘要；旧清单缺少摘要或文件冲突仍需人工检查。远端 provider 不保证恰好执行一次。
 
-**English**: Fault injection does not cover every filesystem crash, and a local HTTP server does not prove universal model compatibility. Explicit `resume` continues from a failed/cancelled manifest's committed prefix, but does not automatically take over running/publishing manifests left by SIGKILL or guarantee exactly-once remote provider execution.
+**English**: Fault injection does not cover every filesystem crash, and a local HTTP server does not prove universal model compatibility. Explicit `resume` can recover failed/cancelled/running/publishing states under the lock after source/config checks. Existing final output must match a previously saved publication digest; legacy manifests without a digest and conflicting files need manual inspection. Remote provider execution is not exactly once.
 
 ## 11. 读懂新阶段 / Understand the later stages
 
@@ -264,12 +264,16 @@ stateDiagram-v2
 
 **English**: The CSV source reads logical rows, names fields from the header, and keeps values as strings. Optional regeneration sends safe error-path feedback to the provider after structured-output failure; it has a separate count from HTTP transport retries. After schema validation, the optional judge scores the generated object. Exact or MinHash deduplication then checks the full record and registers a key only after sink acceptance. The first accepted Parquet row defines its Arrow schema; incompatible later rows go to the dead-letter file.
 
-**中文**：`resume` 获取输出命名空间的独占文件锁，验证 failed/cancelled 清单的配置 hash 与源指纹，将 partial/dead-letter 截断到已提交字节，然后从下一条源位置继续。已接受前缀还用于重建去重状态和 Parquet Schema。失败策略必须对前缀与新增记录合计检查。Parquet 发布保留 JSONL partial，直到独立的 Parquet 文件和 completed 清单都持久化。
+**中文**：`resume` 获取输出命名空间的独占文件锁，验证中断清单的配置 hash 与源指纹，将 partial/dead-letter 截断到已提交字节，然后从下一条源位置继续。已接受前缀还用于重建去重状态和 Parquet Schema。失败策略必须对前缀与新增记录合计检查。Parquet 发布保留 JSONL partial，直到独立的 Parquet 文件和 completed 清单都持久化。
 
-**English**: `resume` takes an exclusive file lock for the output namespace, checks the failed/cancelled manifest against the configuration hash and source fingerprint, truncates partial/dead-letter files to committed bytes, and continues after the committed source position. Accepted rows rebuild deduplication state and the Parquet schema. Failure policies apply to the combined old and new counts. Parquet publication keeps the JSONL partial until the independent Parquet file and completed manifest are durable.
+**English**: `resume` takes an exclusive file lock for the output namespace, checks the interrupted manifest against the configuration hash and source fingerprint, truncates partial/dead-letter files to committed bytes, and continues after the committed source position. Accepted rows rebuild deduplication state and the Parquet schema. Failure policies apply to the combined old and new counts. Parquet publication keeps the JSONL partial until the independent Parquet file and completed manifest are durable.
 
-**中文**：`inspect` 读取已发布 JSONL/Parquet，统计顶层列、空值、基数与数值范围。混合列的均值只用数值项求和及计数；没有数值项时为 null。延迟均值使用增量统计，分位数来自最多 4096 个均匀蓄水池样本，超过该数量时是近似值。去重状态及恢复时读取的已接受前缀仍可能随数据集增长，不应把整个程序称为恒定内存。
+**中文**：`inspect` 读取已发布 JSONL/Parquet，统计顶层列、空值、基数与数值范围。混合列的均值只用数值项求和及计数；没有数值项时为 null。延迟均值使用增量统计，分位数来自最多 4096 个均匀蓄水池样本，超过该数量时是近似值。去重索引仍随唯一记录数增长，但恢复不再缓存整份已接受前缀。新清单保存 JSONL/CSV 字节偏移，直接定位下一条记录；旧清单仍支持扫描跳过。源指纹校验仍需要全文件读取。
 
-**English**: `inspect` reads published JSONL/Parquet and summarizes top-level columns, nulls, distinct counts, and numeric ranges. A mixed column's mean uses numeric values and their count only; it is null when there are no numbers. Latency mean is incremental, while percentiles use a uniform reservoir of at most 4096 observations and become approximate above that size. Deduplication state and accepted rows read during resume can still grow with the dataset, so the whole program does not have constant memory usage.
+**English**: `inspect` reads published JSONL/Parquet and summarizes top-level columns, nulls, distinct counts, and numeric ranges. A mixed column's mean uses numeric values and their count only; it is null when there are no numbers. Latency mean is incremental, while percentiles use a uniform reservoir of at most 4096 observations and become approximate above that size. The dedup index still grows with unique records, but resume no longer buffers the accepted prefix. New manifests store JSONL/CSV byte offsets to seek to the next record; older manifests still support scanning and skipping. Source fingerprint checks still read the whole file.
+
+**中文**：RPM/TPM 在 HTTP 发送前联合检查；预算不足时释放 semaphore，等待后重新检查。单次预估超过 TPM 上限时拒绝。实际 usage 修正同一请求事件并保留原过期时间；真实用量超过预估不能撤销已发送请求。同名生成/judge 共享 provider 状态。CSV 解析时即限制每条原始记录（含表头）为 8 MiB、字段数为 65,536，并拒绝空或重复表头。延迟统计以每次返回的逻辑 provider 调用为样本，包含失败、重生成与 judge；内部重试和等待计入该样本，取消时丢弃的在途调用不计入。
+
+**English**: RPM/TPM are checked together before HTTP sends. When a budget is full, the semaphore permit is released and both budgets are rechecked after waiting. Estimates above the TPM cap are rejected. Actual usage corrects the same event without changing its expiry; excess actual usage cannot undo sent requests. Generation and judging with the same provider name share state. CSV parsing limits each raw record, including the header, to 8 MiB and 65,536 fields, rejecting empty or duplicate headers. Each returned logical provider call contributes a latency sample, including failures, regeneration, and judging. Internal retries and waits belong to that sample; in-flight calls dropped on cancellation are absent.
 
 **下一步 / Next**：完成 [实验手册](LABS.md)，再用 [术语与检查题](GLOSSARY.md) 自测。 / Complete the [labs](LABS.md), then use the [glossary and review questions](GLOSSARY.md) to assess your understanding.

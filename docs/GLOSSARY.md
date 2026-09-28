@@ -21,7 +21,7 @@
 | 重新生成 | Regeneration | Schema 拒绝后将修复反馈交给 provider 再生成 / Calling the provider again with repair feedback after schema rejection |
 | 评判 | Judge | 第二次 provider 调用给生成内容评分并筛选 / A second provider call that scores and filters generated content |
 | 去重 | Deduplication | 在 sink 接受后登记精确或 MinHash 键 / Registering exact or MinHash keys after sink acceptance |
-| 恢复 | Resume | 校验失败/取消清单、源与配置后，从已提交前缀继续 / Continuing a failed/cancelled run from its committed prefix after source/config checks |
+| 恢复 | Resume | 校验中断清单、源与配置后，从已提交前缀继续 / Continuing an interrupted run from its committed prefix after source/config checks |
 | 指数退避 | Exponential backoff | 重试间隔随尝试次数增加，带上限 / Increasing retry intervals with a cap |
 | 抖动 | Jitter | 随机化等待时间以分散重试 / Randomized delay to spread retries |
 | 取消令牌 | Cancellation token | 共享取消信号 / Shared cancellation signal |
@@ -96,9 +96,9 @@
 
 ### 8. 已保存偏移，resume 还需要检查什么？ / What must resume check beyond saved offsets?
 
-**中文**：当前 `resume` 校验配置 hash 和源指纹，截断未提交尾部，恢复计数、去重状态及 Parquet Schema；输出命名空间使用跨进程锁，避免并发恢复。它只接受 failed/cancelled 清单，不自动处理 SIGKILL 留下的 running/publishing 状态。
+**中文**：当前 `resume` 校验配置 hash 和源指纹，截断未提交尾部，恢复计数、去重状态及 Parquet Schema；输出命名空间使用跨进程锁，避免并发恢复。锁释放后可以恢复 SIGKILL 留下的 running 状态；publishing 已有最终文件时必须匹配发布摘要。新检查点保存源字节偏移；重建去重状态逐行进行，索引本身仍随数据量增长。
 
-**English**: Current `resume` checks the configuration hash and source fingerprint, truncates uncommitted tails, and restores counters, deduplication state, and the Parquet schema. A cross-process namespace lock prevents concurrent resume. It accepts failed/cancelled manifests only; running/publishing states left by SIGKILL are not recovered automatically.
+**English**: Current `resume` checks the configuration hash and source fingerprint, truncates uncommitted tails, and restores counters, deduplication state, and the Parquet schema. A cross-process namespace lock prevents concurrent resume. After the lock is released, running states left by SIGKILL can be resumed. A publishing state with final output requires a matching publication digest. New checkpoints store source byte offsets; dedup state is rebuilt row by row, while the index itself still grows with data size.
 
 ## 常见误区 / Common misconceptions
 

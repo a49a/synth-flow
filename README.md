@@ -58,9 +58,9 @@ synthflow run examples/simple_generation.yaml
 | `data.jsonl.rejected.jsonl` | 被拒绝记录的 ID、位置、错误类别、字段路径和尝试次数 |
 | `data.jsonl.manifest.json` | run ID、状态、源指纹、配置 hash、时间、统计和提交位置；resume 的 checkpoint |
 
-每条已处理记录按源顺序写入，随后同步 accepted/dead-letter 文件，再原子替换并同步 manifest。`sink_state` 包含已提交的源位置、accepted/rejected 字节数和记录数。这些字段表示持久化前缀；顶层统计表示处理情况，遇到磁盘错误时不应将它们直接当作已持久化的行数。
+每条已处理记录按源顺序写入，随后同步 accepted/dead-letter 文件，再原子替换并同步 manifest。`sink_state` 包含已提交的源位置、JSONL/CSV 的 `source_byte_offset`、accepted/rejected 字节数和记录数。这些字段表示持久化前缀；顶层统计表示处理情况，遇到磁盘错误时不应将它们直接当作已持久化的行数。
 
-成功发布使用同目录硬链接：只会创建不存在的最终路径，不会覆盖并发创建的文件。Parquet 运行先在 `.publishing` 临时文件中完成转换再链接发布。当前面向支持硬链接和目录同步的本地文件系统（macOS/Linux）。完成后清理 partial 与临时文件；清理失败不影响完整输出。每条记录同步的策略优先保证正确性，可配置提交批次留待后续。
+成功发布使用同目录硬链接：只会创建不存在的最终路径，不会覆盖并发创建的文件。Parquet 运行先在同目录唯一的 `.synthflow-publish-*` 临时文件中完成转换，再记录最终文件的 `publication_digest` 并链接发布。当前面向支持硬链接和目录同步的本地文件系统（macOS/Linux）。完成后清理 partial 与临时文件；清理失败不影响完整输出。SIGKILL 可能留下孤立转换文件，恢复会使用新的临时文件，不覆盖未知文件。每条记录同步的策略优先保证正确性，可配置提交批次留待后续。
 
 状态为 `running`、`publishing`、`completed`、`failed`、`cancelled`。数据文件和 manifest 不是跨文件事务：如果在发布窗口中被强制终止，可能同时存在完整数据和 `publishing` 清单。消费者应以 **正式文件存在且 manifest 为 completed** 为完成条件。
 
@@ -72,14 +72,15 @@ Ctrl+C 取消在途请求、保留已提交前缀并记录 `cancelled`，退出�
 synthflow resume examples/simple_generation.yaml
 ```
 
-`resume` 从 manifest 记录的 checkpoint 续跑上次 `failed` 或 `cancelled` 的运行：
+`resume` 从 manifest 的 checkpoint 恢复 `failed`、`cancelled`、`running` 或 `publishing` 运行：
 
-- 校验 pipeline 配置 hash、源文件指纹与 manifest 一致，manifest 状态必须是 `failed`/`cancelled`；`completed` 或正在运行的清单会拒绝。
+- 校验配置 hash、源指纹和产物路径。活跃进程持有锁时拒绝恢复；SIGKILL 释放锁后允许接管 `running` 清单。`completed` 清单不重复执行。
 - 输出路径对应的 `.lock` 文件提供跨进程独占锁，防止多个 run/resume 同时修改同一检查点。
 - partial 与 dead-letter 截断到 manifest 记录的提交字节前缀后追加写入；崩溃遗留的尾部被丢弃。
-- 已配置去重时，dedup 状态从已提交前缀的记录重建；Parquet 的首条已接受记录也用于重建原 Schema，保持恢复前后的验收规则一致。
-- 已提交的源位置直接跳过；续跑后的正式输出恰好包含每条记录一次。
-- 新 manifest 记录 `resumed_from`（前次 run ID 与已提交数量）；失败策略按全数据集（含继承前缀）计算。报告统计只统计本次运行新处理的记录。
+- 已接受前缀逐行校验并重建 dedup 状态，不再将整个前缀装入内存；索引本身仍随唯一记录数增长。Parquet 从首条已接受记录重建原 Schema。
+- 新 JSONL/CSV 检查点按源字节偏移定位，旧检查点仍兼容扫描跳过；源身份校验仍需扫描文件计算指纹。按序提交避免重复输出已提交的源位置。
+- `publishing` 清单若已有最终文件，仅当文件内容匹配发布前保存的 digest 才确认完成；不匹配或旧清单缺少 digest 时拒绝自动接管。没有最终文件时从 JSONL 检查点重试。
+- 新 manifest 记录 `resumed_from`（前次 run ID 与已提交数量）；strict/最大拒绝数不能通过恢复绕过；拒绝比例在全数据处理完后计算，取消时的暂时高比例不阻止继续。正常续跑统计只包含新增记录；确认已发布文件时保留原报告。
 
 ## 配置
 
@@ -117,7 +118,7 @@ providers:
 - `timeout_ms` 覆盖每次 HTTP 请求和响应体读取；等待并发许可与重试退避不计入单次超时。
 - `Retry-After` 支持秒数和 HTTP 日期；当前等待上限仍由 `max_delay_ms` 限制。
 - `max_attempts` 包含首次请求；配置范围为 1–100，并发范围为 1–1024。
-- `rate_limit` 是 60 秒滑动窗口：RPM 按每次 HTTP 尝试计，重试也占用配额；TPM 按每次请求前的 prompt 长度估算预留，响应返回真实 usage 后修正。每次尝试在取得 semaphore 前等待限流，被取消的请求只浪费自己的预留。
+- `rate_limit` 是 60 秒滑动窗口：在每次 HTTP 发送前联合检查 RPM/TPM，包含重试。预算不足时释放 semaphore、等待后重新检查。单次预估 token 超过 TPM 上限会拒绝；真实 usage 修正原请求事件，沿用原过期时间，不产生额外负数额度。TPM 是估算准入，实际 usage 超过预估时无法撤销已发送请求，会约束后续发送。同一配置名用于生成与 judge 时共享 provider、并发与限流状态。
 - `provider_usage` 记录实际请求数、重试数、已返回的 prompt/completion tokens 和已完成 HTTP 尝试的累计耗时。取消请求可能已产生服务端费用，但未返回 usage，不能据此推断实际账单。
 
 Mock 使用 `type: mock` 和 `response` 模板，可选 `concurrency`，默认 1。上下文为 `record`、渲染后的 `prompt`、`prompt_hash`、`feedback`（重生成时的修复说明）和 `generated`（作为 judge 时的被评对象）；将字符串插入 JSON 时使用 `tojson`。mock 的生成内容和记录 ID 保持确定性，每次独立执行的 run ID 不同。
@@ -191,7 +192,7 @@ errors:
 ### 数据契约与资源限制
 
 - 只接受 DSL `version: 1`，未知配置字段报错。配置错误尽可能提供字段路径和期望类型，不回显错误值。
-- 输入必须为对象，`generated`、`judge`、`_meta` 是保留字段。JSONL 不接受空行，支持 CRLF 和无末尾换行。CSV 以表头命名（RFC 4180 引号/内嵌换行/CRLF），所有值为字符串；行宽与表头不一致视为源错误。
+- 输入必须为对象，`generated`、`judge`、`_meta` 是保留字段。JSONL 不接受空行，支持 CRLF 和无末尾换行。CSV 以表头命名（RFC 4180 引号/内嵌换行/CRLF），所有值为字符串；空表头、重复表头、行宽不一致视为源错误。表头与每条逻辑记录在解析过程中限制原始字节为 8 MiB、字段数为 65,536，超限即停止读取。
 - 生成模板支持 `{{ record.topic }}` 和 `{{ topic }}`，`record` 始终表示完整输入。变量缺失导致拒绝；模板不提供环境变量、shell 或文件系统入口。
 - 输出必须是纯 JSON 对象。Schema 支持嵌套对象、数组、基本类型、required、properties、enum 等。真正的 Schema 引用暂不支持；普通属性名或枚举数据中的 `$ref` 不会被误判。
 - 输出保留原始字段，追加 `generated`（启用 judge 时还有 `judge`）和 `_meta`；元数据包含记录 ID、run ID、源位置和指纹、配置 hash、DSL 版本、provider/model、prompt hash、attempt、模板引擎版本以及 judge 信息。
@@ -200,7 +201,7 @@ errors:
 
 ### 指标与成本
 
-- 报告包含按记录累计成功生成调用耗时的摘要：`latency.mean_ms / p50_ms / p95_ms / p99_ms`。均值为增量计算；分位数来自最多 4096 个均匀蓄水池样本，超过该数量时为近似值。当前延迟口径不包含失败调用或 judge 调用。
+- `latency_calls_total` 记录已消费记录中返回的 provider 调用数量，包含失败调用、重生成和 judge。`latency.mean_ms / p50_ms / p95_ms / p99_ms` 按每次逻辑调用统计，包含其内部 HTTP 重试、等待和退避；取消时丢弃的在途调用不计入。均值增量计算；分位数使用最多 4096 个蓄水池样本，超过该数量时为近似值。
 - `prompt_tokens_total` / `completion_tokens_total` 为引擎视角的全部 provider 调用（含 judge）返回的 usage 之和；mock 不返回 usage。
 - 可选 `pricing: {input_usd_per_mtok: 10.0, output_usd_per_mtok: 20.0}` 将其换算为 `estimated_cost_usd`（估算值，未含被取消请求的服务端费用）。
 - 运行期间每 500 条或 2 秒记录一次 progress 日志事件（processed/accepted/rejected/rate）。

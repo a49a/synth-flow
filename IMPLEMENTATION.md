@@ -60,14 +60,14 @@ cargo run -p synthflow-cli -- run examples/reliable_generation.yaml
 以下条目在 `main` 分支按阶段各成一个 commit；每个 commit 均通过 fmt / clippy -D warnings / 全量测试。
 
 1. **Phase 4 结构化输出重生成**（`regenerate_on_invalid`，0–3 次修复重试，反馈只含规则路径；HTTP 附加在 user message，mock 经 `feedback` 变量注入；`_meta.attempt` 汇总全部调用）。
-2. **Phase 5 RPM/TPM 限流**（60 秒滑动窗口，预留式记账保证并发不超预算；TPM 先按 prompt 长度估算、响应后用真实 usage 修正；限流等待先于 semaphore 与退避；tokio paused-time 单测验证准入时刻）。
+2. **Phase 5 RPM/TPM 限流**（60 秒滑动窗口，在发送前联合检查 RPM/TPM；每次重试计入，超额估算拒绝；实际 usage 修正原事件；等待配额时释放 semaphore；tokio paused-time 单测验证窗口行为）。
 3. **Phase 6 Judge**（第二个 provider 渲染 judge prompt，解析数值分数并按 `min_score` 过滤；`judge_score`/`judge_output` 诊断；通过记录追加 `judge` 证据字段与元数据；mock judge 可模板化 `generated`）。
 4. **Phase 7 精确去重**（`method: exact`：点路径字段提取 + 可选 lowercase 规范化 + BLAKE3 键；`duplicate`/`dedup_field` 拒绝类别；`restore()` 供 resume 重建状态）。
 5. **Phase 8 MinHash 去重**（`method: minhash`：词 n-gram shingle、成对独立置换签名（默认 128 维）、LSH 分带候选查找、签名相同分量比例近似 Jaccard；阈值/维数/带数/shingle 全部校验）。
 6. **CSV source**（RFC 4180 流式解析，表头命名、全字符串值、行宽校验、8 MiB 行限制；fingerprint 与 artifact 冲突防护与 JSONL 一致）。
-7. **Phase 9 Parquet sink**（`output.format: parquet` + `batch_size`。关键设计：**partial 始终是逐条同步的 JSONL**，因此 resume 语义与 JSONL 完全一致；每条记录对照首条推断的 Arrow schema 校验，schema 外字段或类型冲突按记录拒绝（`sink_row`），绝不静默丢列；发布时在 `.publishing` 临时文件中转换为 row group 后原子链接）。
+7. **Phase 9 Parquet sink**（`output.format: parquet` + `batch_size`。关键设计：**partial 始终是逐条同步的 JSONL**，因此 resume 语义与 JSONL 完全一致；每条记录对照首条推断的 Arrow schema 校验，schema 外字段或类型冲突按记录拒绝（`sink_row`），绝不静默丢列；发布时在独立 `.synthflow-publish-*` 临时文件中转换，保存发布摘要后原子链接）。
 8. **Phase 10/11 Checkpoint 消费 + Resume**（`synthflow resume`：校验配置 hash、源指纹与终态；partial/dead-letter 截断到提交字节前缀后追加；dedup 状态从前缀重建；跳过已提交源位置，确定性续跑不重复输出；新 manifest 记录 `resumed_from`；失败策略按全数据集计算）。
-9. **Phase 12 指标**（按记录累计成功生成调用耗时，均值增量计算，p50/p95/p99 使用至多 4096 项蓄水池样本；引擎侧 prompt/completion token 总量含 judge 调用；可选 `pricing` 输出 `estimated_cost_usd`；每 500 条或 2 秒的 progress 日志事件）。
+9. **Phase 12 指标**（按返回的逻辑 provider 调用统计耗时，包含失败、重生成与 judge；均值增量计算，p50/p95/p99 使用至多 4096 项蓄水池样本；引擎侧 prompt/completion token 总量含 judge 调用；可选 `pricing` 输出 `estimated_cost_usd`；每 500 条或 2 秒的 progress 日志事件）。
 10. **Phase 13 Inspect**（`synthflow inspect <jsonl|parquet> [--json]`：行数、字节、列类型、非空/空值（缺失键计空值）、数值 min/max/mean、上限一百万的去重基数；Parquet 经 Arrow 批解码；SQL 查询未实现）。
 
 新增示例：`judge_generation.yaml`、`csv_generation.yaml`（含 `topics.csv`）、`parquet_generation.yaml`。
@@ -86,3 +86,14 @@ cargo run -p synthflow-cli -- inspect examples/output/rust_instruction.parquet
 ```
 
 已知限制：DataFusion SQL 查询、分布式执行（设计文档第 47 节之后）、有界 blocking worker 文件 I/O、可配置提交批次未实现。教学文档（docs/）已更新，覆盖 Phase 0–13 的主要行为与边界。
+
+
+## 后续可靠性整改 / Reliability follow-up
+
+- 联合 RPM/TPM 准入，超额预估拒绝，同一事件修正 usage 并保留原到期时间；同名 generator/judge 共享状态。 / Joint RPM/TPM admission, oversized-estimate rejection, usage correction at the original expiry, and shared state for the same generator/judge provider.
+- CSV 使用 csv-core 的有界缓冲区，在解析时限制记录/表头大小和字段数，拒绝重复或空表头。 / Bounded csv-core buffers limit record/header bytes and field counts during parsing, rejecting duplicate or empty headers.
+- 独占锁下恢复 running/publishing；最终文件通过发布前持久化的 digest 验证。 / Running/publishing recovery under an exclusive lock, verifying final output against a digest persisted before publication.
+- 逐行重建 dedup，JSONL/CSV 保存字节偏移并 seek；旧清单兼容。 / Streaming dedup rebuild, persisted JSONL/CSV byte offsets and seek, with legacy checkpoint compatibility.
+- 延迟按返回的逻辑调用采样，包含失败、重生成和 judge，新增 latency_calls_total。 / Latency samples cover returned logical calls, including failures, regeneration, and judging, with latency_calls_total.
+
+SIGKILL 可能留下不会阻止恢复的孤立转换临时文件；缺少发布摘要的旧 publishing 清单若已有最终文件仍需人工检查。 / SIGKILL may leave orphan conversion files that do not block recovery; legacy publishing manifests with final output but no digest still require manual inspection.

@@ -228,13 +228,13 @@ cargo test -p synthflow --test reliability manifest_write_failure_preserves_data
 cargo test -p synthflow --test reliability publish_race_never_clobbers_another_writers_output -- --exact
 ```
 
-**预期 / Expected**：测试提交第一条记录，让第二个 HTTP 请求保持在途，然后向子进程发信号。SIGINT 得到退出码 130 和 cancelled 清单；强制终止后清单仍为 running，但已经提交的位置和字节仍可检查。 / The tests commit the first record, leave the second HTTP request in flight, then signal the child process. SIGINT produces exit code 130 and a cancelled manifest. Forced termination leaves a running manifest whose last committed position and bytes can still be inspected.
+**预期 / Expected**：测试提交第一条记录，让第二个 HTTP 请求保持在途，然后向子进程发信号。SIGINT 得到退出码 130 和 cancelled 清单；强制终止后清单仍为 running；测试随后执行 resume，验证输出无重复。 / The tests commit the first record, leave the second HTTP request in flight, then signal the child process. SIGINT produces exit code 130 and a cancelled manifest. Forced termination leaves a running manifest; the test then resumes it and verifies that output contains no duplicates.
 
 **解释 / Explanation**：运行状态是持久化观测，不是进程存活探针。这些测试控制故障位置，不等同于真实断电测试。 / Run status is a persisted observation, not a process-liveness probe. These tests control failure locations; they are not power-loss tests.
 
 **思考 / Think**：如果 partial 比 manifest.accepted_bytes 长，恢复程序能否直接把整个文件当作已提交结果？ / If partial is longer than manifest.accepted_bytes, can recovery treat the whole file as committed?
 
-**参考 / Reference**：不能。超出部分可能处于未提交窗口；当前 `resume` 只接受 failed/cancelled 清单，并将 partial 和 dead-letter 截断到清单记录的已提交字节数。SIGKILL 后若清单仍为 running/publishing，不能直接运行 `resume`。 / No. Extra bytes can be uncommitted. Current `resume` accepts failed/cancelled manifests and truncates partial/dead-letter files to committed byte counts. A running/publishing manifest left by SIGKILL cannot be resumed directly.
+**参考 / Reference**：不能。超出部分可能处于未提交窗口；当前 `resume` 获取独占锁并校验源与配置，再将 partial 和 dead-letter 截断到已提交字节数。running 可以恢复；publishing 已有最终文件时，须匹配清单中的发布摘要。 / No. Extra bytes can be uncommitted. Current `resume` takes an exclusive lock, validates source/config identity, and truncates partial/dead-letter files to committed byte counts. Running states can resume; publishing states with final output require the recorded digest to match.
 
 ## 实验 8：验证已实现的高级功能 / Lab 8: Verify implemented advanced features
 
@@ -249,6 +249,8 @@ cargo test -p synthflow --test dedup exact_duplicates_are_rejected_in_commit_ord
 cargo test -p synthflow --test minhash near_duplicate_answers_are_deduplicated_end_to_end -- --exact
 cargo test -p synthflow --test remediation parquet_resume_keeps_the_original_schema_constraints -- --exact
 cargo test -p synthflow --test remediation concurrent_resumes_allow_exactly_one_writer -- --exact
+cargo test -p synthflow --test remediation publishing_snapshot_finishes_only_the_recorded_output -- --exact
+cargo test -p synthflow --test remediation jsonl_and_csv_resume_use_committed_source_offsets -- --exact
 cargo test -p synthflow --test inspect mixed_types_and_unsupported_extensions_are_reported -- --exact
 ```
 
@@ -276,7 +278,7 @@ cargo run -q -p synthflow-cli -- inspect "$LAB_DIR/output/reliable_demo.jsonl" -
 | 作业 / Assignment | 要回答的问题 / Design question | 验收要求 / Acceptance criteria |
 | --- | --- | --- |
 | 批量提交 / Batched commits | 吞吐提升会扩大多大的未提交窗口？ / How much does higher throughput enlarge the uncommitted window? | 正常结束 flush 尾批；故障测试证明清单不引用未同步数据 / Flush the final batch; fault tests prove manifests never refer to unsynchronized data |
-| 崩溃状态恢复 / Crash-state recovery | 如何安全处理 SIGKILL 留下的 running/publishing 清单？ / How can a running/publishing manifest left by SIGKILL be recovered safely? | 校验锁与目录项，测试发布中断及连续/恢复输出一致 / Check locks and directory entries; test publication interruption and output equivalence |
+| 磁盘去重索引 / Disk-backed dedup index | 唯一记录数增长时怎样限制内存？ / How can memory stay bounded as unique records grow? | 索引持久化与检查点一致，恢复输出与内存实现相同 / Keep the persistent index consistent with checkpoints and match in-memory results |
 | SQL 查询 / SQL querying | 如何在 JSONL/Parquet 上限制查询资源？ / How should queries over JSONL/Parquet be bounded? | 查询结果正确，错误可诊断，避免无界内存 / Correct results, diagnosable errors, bounded memory |
 
 **中文**：验收材料应包含：问题、状态或数据模型、失败窗口、测试命令、已知限制。只有性能数字而没有正确性依据，不能证明扩展完成。

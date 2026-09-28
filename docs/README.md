@@ -39,6 +39,6 @@
 
 ## 文档与实现的边界 / Documentation versus implementation
 
-**中文**：教材以当前仓库代码为准。已实现 JSONL/CSV/inline 输入、mock/HTTP provider、Schema 校验与重生成、judge、精确/MinHash 去重、JSONL/Parquet 输出、RPM/TPM 限流、显式 `resume`、指标和 `inspect`。`resume` 仅接受 failed/cancelled 清单；SIGKILL 后若清单仍为 running/publishing，需要人工检查。设计文档还包含未实现的长期目标。
+**中文**：教材以当前仓库代码为准。已实现 JSONL/CSV/inline 输入、mock/HTTP provider、Schema 校验与重生成、judge、精确/MinHash 去重、JSONL/Parquet 输出、RPM/TPM 限流、显式 `resume`、指标和 `inspect`。`resume` 在独占锁下支持 failed/cancelled/running/publishing；已发布文件需要内容摘要验证，旧版缺少摘要或发生冲突时仍需人工检查。设计文档还包含未实现的长期目标。
 
-**English**: These materials describe the current repository. It implements JSONL/CSV/inline sources, mock/HTTP providers, schema validation and regeneration, judging, exact/MinHash deduplication, JSONL/Parquet output, RPM/TPM limiting, explicit `resume`, metrics, and `inspect`. Resume accepts failed/cancelled manifests only; a running/publishing manifest left by SIGKILL needs manual inspection. The design document also contains longer-term goals.
+**English**: These materials describe the current repository. It implements JSONL/CSV/inline sources, mock/HTTP providers, schema validation and regeneration, judging, exact/MinHash deduplication, JSONL/Parquet output, RPM/TPM limiting, explicit `resume`, metrics, and `inspect`. Under an exclusive lock, resume accepts failed/cancelled/running/publishing manifests. Existing final output requires digest verification; legacy manifests without a digest and conflicting files still need manual inspection. The design document also contains longer-term goals.
