@@ -22,6 +22,14 @@ pub struct RunStatistics {
     pub generation_failed_total: u64,
     #[serde(default)]
     pub regeneration_attempts_total: u64,
+    #[serde(default)]
+    pub judge_requests_total: u64,
+    #[serde(default)]
+    pub judge_rejected_total: u64,
+    #[serde(default)]
+    pub judge_failed_total: u64,
+    #[serde(default)]
+    pub duplicate_records_total: u64,
     pub template_failed_total: u64,
     pub structured_output_failed_total: u64,
     pub validation_failed_total: u64,
@@ -37,6 +45,10 @@ impl RunStatistics {
         self.generation_success_total += other.generation_success_total;
         self.generation_failed_total += other.generation_failed_total;
         self.regeneration_attempts_total += other.regeneration_attempts_total;
+        self.judge_requests_total += other.judge_requests_total;
+        self.judge_rejected_total += other.judge_rejected_total;
+        self.judge_failed_total += other.judge_failed_total;
+        self.duplicate_records_total += other.duplicate_records_total;
         self.template_failed_total += other.template_failed_total;
         self.structured_output_failed_total += other.structured_output_failed_total;
         self.validation_failed_total += other.validation_failed_total;
@@ -93,11 +105,19 @@ pub async fn run_with_provider(
     let mut env = template::environment();
     env.add_template("generate", &pipeline.generate.prompt)
         .map_err(|_| Error::Configuration("invalid generation template".into()))?;
+    let judge = build_judge(pipeline)?;
     let source_hash = source_fingerprint(pipeline, &cancellation).await?;
     let mut source = Source::open(&pipeline.source)?;
     let (mut artifacts, mut report) = Artifacts::create(pipeline, source_hash)?;
     let started = Instant::now();
     tracing::info!(run_id = report.run_id, event = "run_started");
+    let tools = StageTools {
+        env: &env,
+        provider: provider.as_ref(),
+        schema: &schema,
+        regenerate_on_invalid: pipeline.generate.regenerate_on_invalid,
+        judge: judge.as_ref(),
+    };
     let mut pending = FuturesOrdered::new();
     let mut source_done = false;
     let mut source_error = None;
@@ -108,15 +128,7 @@ pub async fn run_with_provider(
                 match source.next() {
                     Some(Ok((position, data))) => {
                         report.statistics.source_records_total += 1;
-                        pending.push_back(process(
-                            position,
-                            data,
-                            &env,
-                            provider.as_ref(),
-                            &schema,
-                            pipeline.generate.regenerate_on_invalid,
-                            &cancellation,
-                        ));
+                        pending.push_back(process(position, data, &tools, &cancellation));
                     }
                     Some(Err(error)) => {
                         report.statistics.source_records_total += 1;
@@ -146,7 +158,13 @@ pub async fn run_with_provider(
                         source_fingerprint: report.source_fingerprint.clone(),
                         stage: "accepted", attempt: generated.attempts, generator_provider: pipeline.generate.provider.clone(), generator_model: generated.model,
                         prompt_hash: generated.prompt_hash, template_engine: "minijinja/2",
+                        judge_provider: generated.judge.as_ref().map(|j| j.provider.clone()),
+                        judge_model: generated.judge.as_ref().map(|j| j.model.clone()),
+                        judge_score: generated.judge.as_ref().map(|j| j.score),
                     };
+                    if let Some(judge) = &generated.judge {
+                        input.insert("judge".into(), json!({"provider": judge.provider, "model": judge.model, "score": judge.score}));
+                    }
                     input.insert("generated".into(), generated.value);
                     input.insert("_meta".into(), serde_json::to_value(meta).map_err(|_| Error::Sink("metadata serialization failed".into()))?);
                     artifacts.write_accepted(&Value::Object(input))?;
@@ -235,7 +253,45 @@ struct Generated {
     prompt_hash: String,
     model: String,
     attempts: u32,
+    judge: Option<Judged>,
 }
+struct Judged {
+    provider: String,
+    model: String,
+    score: f64,
+}
+struct JudgeTools {
+    env: minijinja::Environment<'static>,
+    provider: Arc<dyn LlmProvider>,
+    provider_name: String,
+    score_field: String,
+    min_score: f64,
+}
+
+fn build_judge(pipeline: &Pipeline) -> Result<Option<JudgeTools>> {
+    let Some(config) = &pipeline.judge else {
+        return Ok(None);
+    };
+    let provider = create_provider(pipeline.providers.get(&config.provider).ok_or_else(|| {
+        Error::Configuration("judge.provider references an unknown provider".into())
+    })?)?;
+    if !(1..=1024).contains(&provider.concurrency()) {
+        return Err(Error::Configuration(
+            "judge provider concurrency must be in 1..=1024".into(),
+        ));
+    }
+    let mut env = template::environment();
+    env.add_template_owned("judge".to_owned(), config.prompt.clone())
+        .map_err(|_| Error::Configuration("invalid judge template".into()))?;
+    Ok(Some(JudgeTools {
+        env,
+        provider,
+        provider_name: config.provider.clone(),
+        score_field: config.score_field.clone(),
+        min_score: config.min_score,
+    }))
+}
+
 struct Outcome {
     position: u64,
     data: Value,
@@ -243,13 +299,17 @@ struct Outcome {
     statistics: RunStatistics,
     attempts: u32,
 }
+struct StageTools<'a> {
+    env: &'a minijinja::Environment<'a>,
+    provider: &'a dyn LlmProvider,
+    schema: &'a jsonschema::Validator,
+    regenerate_on_invalid: u32,
+    judge: Option<&'a JudgeTools>,
+}
 async fn process(
     position: u64,
     data: Value,
-    env: &minijinja::Environment<'_>,
-    provider: &dyn LlmProvider,
-    schema: &jsonschema::Validator,
-    regenerate_on_invalid: u32,
+    tools: &StageTools<'_>,
     cancellation: &CancellationToken,
 ) -> Outcome {
     let mut statistics = RunStatistics::default();
@@ -257,19 +317,22 @@ async fn process(
     let result = async {
         let mut context = data.as_object().cloned().unwrap_or_default();
         context.insert("record".into(), data.clone());
-        let prompt = template::render(env, "generate", &json!(context)).inspect_err(|_| {
-            statistics.template_failed_total += 1;
-        })?;
+        let prompt =
+            template::render(tools.env, "generate", &json!(context)).inspect_err(|_| {
+                statistics.template_failed_total += 1;
+            })?;
         let mut feedback: Option<String> = None;
         let mut regenerations = 0;
         loop {
             statistics.generation_requests_total += 1;
-            let response = provider
+            let response = tools
+                .provider
                 .generate(
                     GenerateRequest {
                         prompt: &prompt,
                         record: &data,
                         feedback: feedback.as_deref(),
+                        generated: None,
                     },
                     cancellation,
                 )
@@ -288,7 +351,7 @@ async fn process(
                         Err(Error::StructuredOutput)
                     }
                 })
-                .and_then(|generated| match schema.validate(&generated) {
+                .and_then(|generated| match tools.schema.validate(&generated) {
                     Ok(()) => Ok(generated),
                     Err(error) => Err(Error::Validation {
                         instance_path: error.instance_path.to_string(),
@@ -297,14 +360,24 @@ async fn process(
                 });
             match structured {
                 Ok(generated) => {
+                    let judged = judge_record(
+                        &generated,
+                        &prompt,
+                        &data,
+                        tools.judge,
+                        &mut statistics,
+                        cancellation,
+                    )
+                    .await?;
                     return Ok(Generated {
                         value: generated,
                         prompt_hash: blake3::hash(prompt.as_bytes()).to_hex().to_string(),
                         model: response.model,
                         attempts,
+                        judge: judged,
                     });
                 }
-                Err(error) if regenerations < regenerate_on_invalid => {
+                Err(error) if regenerations < tools.regenerate_on_invalid => {
                     regenerations += 1;
                     statistics.regeneration_attempts_total += 1;
                     feedback = Some(repair_feedback(&error));
@@ -342,4 +415,68 @@ fn repair_feedback(error: &Error) -> String {
         }
         other => other.to_string(),
     }
+}
+
+async fn judge_record(
+    generated: &Value,
+    prompt: &str,
+    data: &Value,
+    judge: Option<&JudgeTools>,
+    statistics: &mut RunStatistics,
+    cancellation: &CancellationToken,
+) -> Result<Option<Judged>> {
+    let Some(tools) = judge else {
+        return Ok(None);
+    };
+    statistics.judge_requests_total += 1;
+    let context = json!({"record": data, "generated": generated, "prompt": prompt});
+    let prompt = template::render(&tools.env, "judge", &context)?;
+    let response = tools
+        .provider
+        .generate(
+            GenerateRequest {
+                prompt: &prompt,
+                record: data,
+                feedback: None,
+                generated: Some(generated),
+            },
+            cancellation,
+        )
+        .await
+        .inspect_err(|_| {
+            statistics.judge_failed_total += 1;
+        })?;
+    let verdict = serde_json::from_str::<Value>(&response.text)
+        .map_err(|_| {
+            statistics.judge_failed_total += 1;
+            Error::JudgeOutput {
+                message: "judge reply was not valid JSON".into(),
+            }
+        })?
+        .get(&tools.score_field)
+        .cloned()
+        .ok_or_else(|| {
+            statistics.judge_failed_total += 1;
+            Error::JudgeOutput {
+                message: format!("judge reply is missing the field {}", tools.score_field),
+            }
+        })?;
+    let score = verdict.as_f64().ok_or_else(|| {
+        statistics.judge_failed_total += 1;
+        Error::JudgeOutput {
+            message: format!("judge field {} is not numeric", tools.score_field),
+        }
+    })?;
+    if score < tools.min_score {
+        statistics.judge_rejected_total += 1;
+        return Err(Error::JudgeScore {
+            score,
+            min_score: tools.min_score,
+        });
+    }
+    Ok(Some(Judged {
+        provider: tools.provider_name.clone(),
+        model: response.model,
+        score,
+    }))
 }

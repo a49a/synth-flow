@@ -24,6 +24,8 @@ pub struct GenerateRequest<'a> {
     pub record: &'a Value,
     /// Structured-output repair feedback for regeneration attempts.
     pub feedback: Option<&'a str>,
+    /// The generated record under evaluation when this is a judge call.
+    pub generated: Option<&'a Value>,
 }
 pub struct GenerateResponse {
     pub text: String,
@@ -115,7 +117,7 @@ impl LlmProvider for MockProvider {
             return Err(Error::Cancelled);
         }
         self.metrics.requests.fetch_add(1, Ordering::Relaxed);
-        let context = json!({"record": request.record, "prompt": request.prompt, "prompt_hash": blake3::hash(request.prompt.as_bytes()).to_hex().to_string(), "feedback": request.feedback});
+        let context = json!({"record": request.record, "prompt": request.prompt, "prompt_hash": blake3::hash(request.prompt.as_bytes()).to_hex().to_string(), "feedback": request.feedback, "generated": request.generated});
         Ok(GenerateResponse {
             text: template::render(&self.env, "mock", &context)?,
             model: "synthflow-mock-v1".into(),

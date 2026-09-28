@@ -87,6 +87,7 @@ async fn generous_limits_do_not_disturb_normal_requests() {
                 prompt: "test",
                 record: &record,
                 feedback: None,
+                generated: None,
             },
             &CancellationToken::new(),
         )

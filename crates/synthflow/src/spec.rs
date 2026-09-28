@@ -21,6 +21,8 @@ pub struct Pipeline {
     pub source: SourceConfig,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub generate: Generation,
+    #[serde(default)]
+    pub judge: Option<JudgeConfig>,
     pub output: Output,
     #[serde(default)]
     pub errors: ErrorPolicy,
@@ -115,6 +117,20 @@ pub struct Generation {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct JudgeConfig {
+    pub provider: String,
+    pub prompt: String,
+    #[serde(default = "default_score_field")]
+    pub score_field: String,
+    pub min_score: f64,
+}
+
+fn default_score_field() -> String {
+    "score".into()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Output {
     pub format: OutputFormat,
     pub path: PathBuf,
@@ -190,6 +206,20 @@ impl Pipeline {
         }
         if self.generate.regenerate_on_invalid > 3 {
             return Err(invalid("generate.regenerate_on_invalid must be in 0..=3"));
+        }
+        if let Some(judge) = &self.judge {
+            if !self.providers.contains_key(&judge.provider) {
+                return Err(invalid("judge.provider references an unknown provider"));
+            }
+            if judge.prompt.trim().is_empty() {
+                return Err(invalid("judge.prompt cannot be empty"));
+            }
+            template::validate(&judge.prompt, "judge")?;
+            if !judge.min_score.is_finite() || judge.score_field.trim().is_empty() {
+                return Err(invalid(
+                    "judge requires a finite min_score and a non-empty score_field",
+                ));
+            }
         }
         template::validate(&self.generate.prompt, "generation")?;
         for provider in self.providers.values() {
@@ -423,8 +453,13 @@ impl Pipeline {
         } else {
             String::new()
         };
+        let judge = if self.judge.is_some() {
+            "\n  ↓\nJudge"
+        } else {
+            ""
+        };
         format!(
-            "{source}\n  ↓\nPromptRender\n  ↓\nGenerate({})\n  ↓\nJsonParse\n  ↓\nSchemaValidate{regenerate}\n  ↓\nJsonlSink",
+            "{source}\n  ↓\nPromptRender\n  ↓\nGenerate({})\n  ↓\nJsonParse\n  ↓\nSchemaValidate{regenerate}{judge}\n  ↓\nJsonlSink",
             self.generate.provider
         )
     }

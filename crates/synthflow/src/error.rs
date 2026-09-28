@@ -38,6 +38,14 @@ pub enum Error {
         instance_path: String,
         schema_path: String,
     },
+    #[error("judge output error: {message}")]
+    JudgeOutput { message: String },
+    #[error("judge score {score} is below the minimum {min_score}")]
+    JudgeScore { score: f64, min_score: f64 },
+    #[error("duplicate of an earlier accepted record")]
+    Duplicate,
+    #[error("dedup field {field} is missing from the record")]
+    DedupField { field: String },
     #[error("sink error: {0}")]
     Sink(String),
     #[error("run cancelled")]
@@ -84,6 +92,10 @@ impl Error {
             ),
             Self::StructuredOutput => ("structured_output", "parse"),
             Self::Validation { .. } => ("validation", "validate"),
+            Self::JudgeOutput { .. } => ("judge_output", "judge"),
+            Self::JudgeScore { .. } => ("judge_score", "judge"),
+            Self::Duplicate => ("duplicate", "dedup"),
+            Self::DedupField { .. } => ("dedup_field", "dedup"),
             Self::Sink(_) => ("sink", "sink"),
             Self::Cancelled => ("cancelled", "run"),
             Self::FailurePolicy(_) => ("failure_policy", "run"),

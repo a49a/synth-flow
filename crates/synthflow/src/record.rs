@@ -15,6 +15,12 @@ pub struct RecordMeta {
     pub generator_model: String,
     pub prompt_hash: String,
     pub template_engine: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge_score: Option<f64>,
 }
 
 /// serde_json's default object map is key-sorted, including nested objects.
