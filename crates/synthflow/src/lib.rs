@@ -2,6 +2,7 @@
 pub mod dedup;
 pub mod engine;
 pub mod error;
+pub mod inspect;
 pub mod provider;
 mod ratelimit;
 pub mod record;

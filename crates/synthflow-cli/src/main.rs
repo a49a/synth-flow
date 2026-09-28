@@ -31,6 +31,13 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
+    /// Print basic statistics for a published .jsonl or .parquet dataset.
+    Inspect {
+        dataset: PathBuf,
+        /// Emit the full summary as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -59,11 +66,47 @@ async fn main() -> ExitCode {
     }
 }
 async fn execute(cli: Cli) -> synthflow::Result<ExitCode> {
+    if let Command::Inspect { dataset, json } = &cli.command {
+        let summary = synthflow::inspect::summarize(dataset)?;
+        if *json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .map_err(|_| synthflow::Error::Sink("summary serialization failed".into()))?
+            );
+        } else {
+            println!(
+                "{}: {} rows, {} bytes, {} columns",
+                summary.path.display(),
+                summary.rows,
+                summary.bytes,
+                summary.columns.len()
+            );
+            println!(
+                "{:<24} {:<8} {:>10} {:>8}  numeric",
+                "column", "type", "non-null", "null"
+            );
+            for column in &summary.columns {
+                let numeric = match (column.min, column.max, column.mean) {
+                    (Some(min), Some(max), Some(mean)) => {
+                        format!("min={min} max={max} mean={mean:.3}")
+                    }
+                    _ => "-".to_owned(),
+                };
+                println!(
+                    "{:<24} {:<8} {:>10} {:>8}  {}",
+                    column.name, column.data_type, column.count, column.null_count, numeric
+                );
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let path = match &cli.command {
         Command::Validate { pipeline }
         | Command::Plan { pipeline }
         | Command::Run { pipeline, .. }
         | Command::Resume { pipeline, .. } => pipeline,
+        Command::Inspect { .. } => unreachable!("handled above"),
     };
     let mut pipeline = Pipeline::load(path)?;
     match cli.command {
@@ -103,6 +146,7 @@ async fn execute(cli: Cli) -> synthflow::Result<ExitCode> {
                 ExitCode::FAILURE
             });
         }
+        Command::Inspect { .. } => unreachable!("handled above"),
     }
     Ok(ExitCode::SUCCESS)
 }
