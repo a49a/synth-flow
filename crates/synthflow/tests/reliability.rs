@@ -203,6 +203,8 @@ impl LlmProvider for MutateSource {
             text: "{\"answer\":\"ok\"}".into(),
             model: "custom".into(),
             attempts: 1,
+            prompt_tokens: None,
+            completion_tokens: None,
         })
     }
 }
@@ -477,6 +479,8 @@ impl LlmProvider for InterfereWithOutput {
             text: "{\"answer\":\"ok\"}".into(),
             model: "test".into(),
             attempts: 1,
+            prompt_tokens: None,
+            completion_tokens: None,
         })
     }
 }

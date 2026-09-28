@@ -35,6 +35,8 @@ impl LlmProvider for ScriptedProvider {
             text,
             model: "scripted".into(),
             attempts: 1,
+            prompt_tokens: None,
+            completion_tokens: None,
         })
     }
     fn concurrency(&self) -> usize {

@@ -1,7 +1,8 @@
 use crate::{
     Error, Result,
     error::ProviderErrorKind,
-    spec::{MAX_RECORD_BYTES, ProviderConfig, RetryPolicy},
+    ratelimit::{SlidingWindow, estimate_tokens},
+    spec::{MAX_RECORD_BYTES, ProviderConfig, RateLimitConfig, RetryPolicy},
     template,
 };
 use async_trait::async_trait;
@@ -28,6 +29,9 @@ pub struct GenerateResponse {
     pub text: String,
     pub model: String,
     pub attempts: u32,
+    /// Reported token usage when the provider returns it.
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -116,6 +120,8 @@ impl LlmProvider for MockProvider {
             text: template::render(&self.env, "mock", &context)?,
             model: "synthflow-mock-v1".into(),
             attempts: 1,
+            prompt_tokens: None,
+            completion_tokens: None,
         })
     }
     fn concurrency(&self) -> usize {
@@ -135,6 +141,8 @@ pub struct OpenAiProvider {
     concurrency: usize,
     timeout: Duration,
     retry: RetryPolicy,
+    rpm: Option<SlidingWindow>,
+    tpm: Option<SlidingWindow>,
     metrics: Metrics,
 }
 impl OpenAiProvider {
@@ -146,6 +154,7 @@ impl OpenAiProvider {
             concurrency,
             timeout_ms,
             retry,
+            rate_limit,
         } = config
         else {
             return Err(Error::Configuration(
@@ -174,6 +183,17 @@ impl OpenAiProvider {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| Error::Configuration("cannot initialize HTTP client".into()))?;
+        let rate_limit = rate_limit
+            .as_ref()
+            .unwrap_or(&RateLimitConfig {
+                requests_per_minute: None,
+                tokens_per_minute: None,
+            })
+            .clone();
+        let RateLimitConfig {
+            requests_per_minute,
+            tokens_per_minute,
+        } = rate_limit;
         Ok(Self {
             client,
             endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
@@ -183,6 +203,8 @@ impl OpenAiProvider {
             concurrency: *concurrency,
             timeout: Duration::from_millis(*timeout_ms),
             retry: retry.clone(),
+            rpm: requests_per_minute.map(|v| SlidingWindow::new(v as u64)),
+            tpm: tokens_per_minute.map(|v| SlidingWindow::new(v as u64)),
             metrics: Metrics::default(),
         })
     }
@@ -259,20 +281,18 @@ impl OpenAiProvider {
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
             .ok_or_else(|| (failure(ProviderErrorKind::InvalidResponse, None), None))?;
-        self.metrics.prompt.fetch_add(
-            value
-                .pointer("/usage/prompt_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            Ordering::Relaxed,
-        );
-        self.metrics.completion.fetch_add(
-            value
-                .pointer("/usage/completion_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            Ordering::Relaxed,
-        );
+        let prompt_tokens = value
+            .pointer("/usage/prompt_tokens")
+            .and_then(Value::as_u64);
+        let completion_tokens = value
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64);
+        self.metrics
+            .prompt
+            .fetch_add(prompt_tokens.unwrap_or(0), Ordering::Relaxed);
+        self.metrics
+            .completion
+            .fetch_add(completion_tokens.unwrap_or(0), Ordering::Relaxed);
         Ok(GenerateResponse {
             text: text.to_owned(),
             model: value
@@ -281,6 +301,8 @@ impl OpenAiProvider {
                 .unwrap_or(&self.model)
                 .to_owned(),
             attempts: attempt,
+            prompt_tokens,
+            completion_tokens,
         })
     }
 }
@@ -310,6 +332,26 @@ impl LlmProvider for OpenAiProvider {
             biased;
             _ = cancellation.cancelled() => Err(Error::Cancelled),
             result = async {
+                // Rate limits reserve before the semaphore and backoff; a
+                // cancelled or failed call only wastes its own reservation.
+                let token_estimate = estimate_tokens(request.prompt);
+                let admission = [
+                    self.rpm.as_ref().map(|limiter| limiter.reserve(1)),
+                    self.tpm.as_ref().map(|limiter| limiter.reserve(token_estimate)),
+                ]
+                .into_iter()
+                .flatten()
+                .max();
+                if let Some(until) = admission {
+                    let now = tokio::time::Instant::now();
+                    if until > now {
+                        tracing::debug!(
+                            wait_ms = (until - now).as_millis() as u64,
+                            event = "rate_limit_wait"
+                        );
+                        tokio::time::sleep_until(until).await;
+                    }
+                }
                 for attempt in 1..=self.retry.max_attempts {
                     let permit = self.permits.acquire().await.map_err(|_| Error::Cancelled)?;
                     self.metrics.requests.fetch_add(1, Ordering::Relaxed);
@@ -319,7 +361,16 @@ impl LlmProvider for OpenAiProvider {
                     self.metrics.latency.fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                     drop(permit); // Never hold provider capacity during backoff.
                     match result {
-                        Ok(response) => return Ok(response),
+                        Ok(response) => {
+                            // Replace the token estimate with reported usage.
+                            if let Some(tpm) = &self.tpm
+                                && let (Some(prompt), Some(completion)) =
+                                    (response.prompt_tokens, response.completion_tokens)
+                            {
+                                tpm.adjust((prompt + completion) as i64 - token_estimate);
+                            }
+                            return Ok(response);
+                        }
                         Err((error, retry_after)) => {
                             if !retryable(&error) || attempt == self.retry.max_attempts { return Err(error); }
                             let cap = self.retry.initial_delay_ms.saturating_mul(2u64.saturating_pow(attempt - 1)).min(self.retry.max_delay_ms);

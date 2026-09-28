@@ -57,7 +57,16 @@ pub enum ProviderConfig {
         timeout_ms: u64,
         #[serde(default)]
         retry: RetryPolicy,
+        #[serde(default)]
+        rate_limit: Option<RateLimitConfig>,
     },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    pub requests_per_minute: Option<u32>,
+    pub tokens_per_minute: Option<u32>,
 }
 
 fn default_timeout() -> u64 {
@@ -201,6 +210,7 @@ impl Pipeline {
                     concurrency,
                     timeout_ms,
                     retry,
+                    rate_limit,
                 } => {
                     if *timeout_ms == 0
                         || *timeout_ms > 3_600_000
@@ -211,6 +221,18 @@ impl Pipeline {
                         || retry.max_delay_ms > 3_600_000
                     {
                         return Err(invalid("invalid provider timeout_ms or retry policy"));
+                    }
+                    if let Some(limit) = rate_limit
+                        && ([limit.requests_per_minute, limit.tokens_per_minute]
+                            .into_iter()
+                            .flatten()
+                            .any(|v| v == 0 || v > 100_000_000)
+                            || (limit.requests_per_minute.is_none()
+                                && limit.tokens_per_minute.is_none()))
+                    {
+                        return Err(invalid(
+                            "rate_limit needs a positive requests_per_minute or tokens_per_minute",
+                        ));
                     }
                     let url = url::Url::parse(base_url)
                         .map_err(|_| invalid("provider base_url must be a valid URL"))?;

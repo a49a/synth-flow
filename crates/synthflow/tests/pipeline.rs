@@ -213,6 +213,7 @@ fn network_configuration_and_missing_credentials_are_validated() {
             concurrency: 1,
             timeout_ms: 100,
             retry: Default::default(),
+            rate_limit: None,
         },
     );
     spec.validate().expect("valid network config");
