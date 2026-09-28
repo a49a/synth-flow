@@ -200,7 +200,7 @@ pub async fn run_with_provider(
     execute(pipeline, provider, cancellation, None, lock).await
 }
 
-/// Continue the failed or cancelled run recorded in the output manifest.
+/// Continue an interrupted run after acquiring its exclusive namespace lock.
 /// Rejects changed pipelines or sources, truncates to the committed prefix,
 /// rebuilds dedup state, and skips already committed source positions.
 pub async fn resume_async(
@@ -229,13 +229,14 @@ pub async fn resume_with_provider(
     // The lock is taken before any checkpoint read so a loser re-reads the
     // winner's terminal state instead of truncating shared artifacts.
     let lock = RunLock::acquire(&crate::spec::normalize_path(&pipeline.output.path)?)?;
-    let prior = prior_manifest(pipeline)?;
+    let mut prior = prior_manifest(pipeline)?;
     // A prefix that already violates the active policies cannot be resumed
     // into a published dataset; fail before touching any artifact.
     if let Some(violation) = policies_violated(
         pipeline,
         prior.sink_state.committed_accepted_records,
         prior.sink_state.committed_rejected_records,
+        prior.status == RunStatus::Publishing,
     ) {
         return Err(Error::FailurePolicy(format!(
             "{violation}; refusing to resume"
@@ -247,15 +248,17 @@ pub async fn resume_with_provider(
             "source changed since the recorded run; refusing to resume".into(),
         ));
     }
-    let mut dedup = pipeline.dedup.as_ref().map(DedupState::new);
-    if let Some(state) = &mut dedup
-        && let Err(error) = committed_rows(&prior)
-            .and_then(|rows| rows.iter().try_for_each(|row| state.restore(row)))
-    {
-        return Err(Error::Configuration(format!(
-            "cannot rebuild dedup state from the committed prefix: {error}"
-        )));
+    if crate::run::finish_interrupted_publication(&mut prior, &cancellation)? {
+        return Ok(prior);
     }
+    let mut dedup = pipeline.dedup.as_ref().map(DedupState::new);
+    visit_committed_rows(&prior, &cancellation, |row| {
+        if let Some(state) = &mut dedup {
+            state.restore(row)?;
+        }
+        Ok(())
+    })
+    .await?;
     let context = ResumeContext {
         skip_through: prior.sink_state.committed_source_position,
         dedup,
@@ -289,23 +292,36 @@ fn prior_manifest(pipeline: &Pipeline) -> Result<crate::run::RunReport> {
             "pipeline changed since the recorded run; use a new output path".into(),
         ));
     }
+    let output = crate::spec::normalize_path(&pipeline.output.path)?;
+    if prior.output_path != output
+        || prior.partial_path != crate::spec::suffix(&output, ".partial")
+        || prior.manifest_path != manifest
+        || prior.dead_letter_path != pipeline.dead_letter_path()?
+    {
+        return Err(Error::Configuration(
+            "manifest artifact paths do not match the pipeline".into(),
+        ));
+    }
     match prior.status {
-        crate::run::RunStatus::Failed | crate::run::RunStatus::Cancelled => Ok(prior),
+        crate::run::RunStatus::Failed
+        | crate::run::RunStatus::Cancelled
+        | crate::run::RunStatus::Running
+        | crate::run::RunStatus::Publishing => Ok(prior),
         crate::run::RunStatus::Completed => Err(Error::Configuration(
             "the recorded run completed; nothing to resume".into(),
         )),
-        crate::run::RunStatus::Running | crate::run::RunStatus::Publishing => {
-            Err(Error::Configuration(
-                "the recorded run has no terminal state; it may still be running".into(),
-            ))
-        }
     }
 }
 
 /// Evaluate every failure policy over dataset-wide counts. Resume runs
 /// inherit the committed prefix, so violations that already exist must not
 /// become publishable just because no new record was processed.
-fn policies_violated(pipeline: &Pipeline, accepted: u64, rejected: u64) -> Option<&'static str> {
+fn policies_violated(
+    pipeline: &Pipeline,
+    accepted: u64,
+    rejected: u64,
+    final_check: bool,
+) -> Option<&'static str> {
     if pipeline.errors.strict && rejected > 0 {
         return Some("strict mode rejects any failed record");
     }
@@ -316,7 +332,7 @@ fn policies_violated(pipeline: &Pipeline, accepted: u64, rejected: u64) -> Optio
     {
         return Some("max_failed_records exceeded");
     }
-    if accepted + rejected > 0 {
+    if final_check && accepted + rejected > 0 {
         let ratio = rejected as f64 / (accepted + rejected) as f64;
         if accepted == 0 {
             return Some("all records were rejected");
@@ -332,27 +348,61 @@ fn policies_violated(pipeline: &Pipeline, accepted: u64, rejected: u64) -> Optio
     None
 }
 
-/// The accepted rows of the committed prefix, used to rebuild dedup state.
-fn committed_rows(prior: &crate::run::RunReport) -> Result<Vec<Value>> {
+/// Validate and rebuild state one accepted row at a time. Memory holds only
+/// one decoded record in addition to the dedup index itself.
+async fn visit_committed_rows(
+    prior: &crate::run::RunReport,
+    cancellation: &CancellationToken,
+    mut visit: impl FnMut(&Value) -> Result<()>,
+) -> Result<()> {
     use std::io::{BufRead, Read};
     let file =
         std::fs::File::open(&prior.partial_path).map_err(|e| Error::io(&prior.partial_path, e))?;
-    let mut rows = Vec::new();
-    for line in std::io::BufReader::new(file)
-        .take(prior.sink_state.accepted_bytes)
-        .lines()
+    if file
+        .metadata()
+        .map_err(|e| Error::io(&prior.partial_path, e))?
+        .len()
+        < prior.sink_state.accepted_bytes
     {
-        let line = line.map_err(|e| Error::io(&prior.partial_path, e))?;
-        rows.push(serde_json::from_str(&line).map_err(|_| {
-            Error::Configuration("committed prefix contains an invalid row".into())
-        })?);
+        return Err(Error::Configuration(
+            "committed prefix is shorter than its checkpoint".into(),
+        ));
     }
-    if rows.len() as u64 != prior.sink_state.committed_accepted_records {
+    let mut reader = std::io::BufReader::new(file.take(prior.sink_state.accepted_bytes));
+    let mut count = 0;
+    let mut line = Vec::new();
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        line.clear();
+        // Emitted JSON can be larger than raw input due to escaping. The
+        // checkpoint bounds the file prefix; retain only one emitted row.
+        let size = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| Error::io(&prior.partial_path, e))?;
+        if size == 0 {
+            break;
+        }
+        if line.last() != Some(&b'\n') {
+            return Err(Error::Configuration(
+                "invalid committed row boundary".into(),
+            ));
+        }
+        let row: Value = serde_json::from_slice(&line)
+            .map_err(|_| Error::Configuration("committed prefix contains an invalid row".into()))?;
+        visit(&row)?;
+        count += 1;
+        if count % 500 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    if count != prior.sink_state.committed_accepted_records {
         return Err(Error::Configuration(
             "committed prefix does not match the recorded row count".into(),
         ));
     }
-    Ok(rows)
+    Ok(())
 }
 
 async fn execute(
@@ -393,6 +443,12 @@ async fn execute(
                 dedup,
                 prior,
             } = context;
+            if source_hash != prior.source_fingerprint {
+                return Err(Error::Configuration(
+                    "source changed while preparing resume".into(),
+                ));
+            }
+            source.resume_from(skip_through, prior.sink_state.source_byte_offset)?;
             let (artifacts, report) = Artifacts::resume(pipeline, source_hash, &prior)?;
             tracing::info!(
                 run_id = report.run_id,
@@ -424,11 +480,13 @@ async fn execute(
             while !source_done && pending.len() < provider.concurrency() {
                 match source.next() {
                     Some(Ok((position, data))) => {
-                        report.statistics.source_records_total += 1;
                         if position <= skip_through {
-                            continue; // already durable from the resumed run
+                            if cancellation.is_cancelled() { return Err(Error::Cancelled); }
+                            if position % 500 == 0 { tokio::task::yield_now().await; }
+                            continue; // Legacy file checkpoints without byte offsets.
                         }
-                        pending.push_back(process(position, data, &tools, &cancellation));
+                        report.statistics.source_records_total += 1;
+                        pending.push_back(process(position, data, source.byte_offset()?, &tools, &cancellation));
                     }
                     Some(Err(error)) => {
                         report.statistics.source_records_total += 1;
@@ -517,7 +575,7 @@ async fn execute(
                 }
             };
             refresh(&mut report, started, provider.as_ref(), pipeline);
-            artifacts.commit(&mut report, outcome.position)?;
+            artifacts.commit(&mut report, outcome.position, outcome.source_byte_offset)?;
             if report.statistics.processed_records_total - progress_count >= 500
                 || progress_at.elapsed() >= std::time::Duration::from_secs(2)
             {
@@ -546,6 +604,7 @@ async fn execute(
             pipeline,
             report.base_accepted_records + report.statistics.accepted_records_total,
             report.base_rejected_records + report.statistics.rejected_records_total,
+            true,
         ) {
             return Err(Error::FailurePolicy(violation.into()));
         }
@@ -698,6 +757,7 @@ fn build_judge(pipeline: &Pipeline, generator: Arc<dyn LlmProvider>) -> Result<O
 
 struct Outcome {
     position: u64,
+    source_byte_offset: Option<u64>,
     data: Value,
     result: Result<Generated>,
     statistics: RunStatistics,
@@ -714,6 +774,7 @@ struct StageTools<'a> {
 async fn process(
     position: u64,
     data: Value,
+    source_byte_offset: Option<u64>,
     tools: &StageTools<'_>,
     cancellation: &CancellationToken,
 ) -> Outcome {
@@ -807,6 +868,7 @@ async fn process(
     .await;
     Outcome {
         position,
+        source_byte_offset,
         data,
         result,
         statistics,

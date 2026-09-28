@@ -497,3 +497,192 @@ async fn resume_cannot_bypass_strict_mode() {
 async fn resume_cannot_bypass_max_failed_records() {
     violating_resume_is_refused(false, Some(0)).await;
 }
+
+#[tokio::test]
+async fn publishing_snapshot_finishes_only_the_recorded_output() {
+    for format in ["jsonl", "parquet"] {
+        let dir = TempDir::new().unwrap();
+        let spec = fixture(&dir, json!([{"topic":"a"}]), format);
+        let mut report = run_with_provider(
+            &spec,
+            ScriptedProvider::answers(&[r#"{"answer":"a"}"#]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(report.succeeded());
+        let bytes = fs::read(&spec.output.path).unwrap();
+        report.status = RunStatus::Publishing;
+        report.finished_at_unix_ms = None;
+        fs::write(&report.manifest_path, serde_json::to_vec(&report).unwrap()).unwrap();
+        let provider = ScriptedProvider::answers(&[]);
+        let resumed = resume_with_provider(&spec, provider.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(resumed.succeeded());
+        assert_eq!(resumed.run_id, report.run_id);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(&spec.output.path).unwrap(), bytes);
+
+        // The same publication intent must never claim unrelated bytes.
+        fs::write(&report.manifest_path, serde_json::to_vec(&report).unwrap()).unwrap();
+        fs::write(&spec.output.path, b"conflicting output").unwrap();
+        let result = resume_with_provider(&spec, provider, CancellationToken::new()).await;
+        assert!(matches!(result, Err(Error::Configuration(_))));
+        assert_eq!(fs::read(&spec.output.path).unwrap(), b"conflicting output");
+        assert_eq!(read_manifest(&spec).status, RunStatus::Publishing);
+    }
+}
+
+#[tokio::test]
+async fn running_and_unlinked_publishing_snapshots_resume_the_prefix() {
+    use std::io::Write;
+    for status in [RunStatus::Running, RunStatus::Publishing] {
+        let dir = TempDir::new().unwrap();
+        let spec = fixture(&dir, json!([{"topic":"a"},{"topic":"b"}]), "parquet");
+        interrupt_after(&spec, 1, &[r#"{"answer":"a"}"#, r#"{"answer":"b"}"#]).await;
+        let mut prior = read_manifest(&spec);
+        prior.status = status;
+        fs::write(&prior.manifest_path, serde_json::to_vec(&prior).unwrap()).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&prior.partial_path)
+            .unwrap()
+            .write_all(b"uncommitted tail")
+            .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&prior.dead_letter_path)
+            .unwrap()
+            .write_all(b"uncommitted tail")
+            .unwrap();
+        // Legacy conversion leftovers must not block or be overwritten by resume.
+        let abandoned = suffix(&spec.output.path, ".publishing");
+        fs::write(&abandoned, b"partial conversion").unwrap();
+        let report = resume_with_provider(
+            &spec,
+            ScriptedProvider::answers(&[r#"{"answer":"b"}"#]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(report.succeeded(), "{:?}", report.errors);
+        assert_eq!(parquet_rows(&spec.output.path), 2);
+        assert_eq!(fs::read(abandoned).unwrap(), b"partial conversion");
+    }
+}
+
+#[tokio::test]
+async fn jsonl_and_csv_resume_use_committed_source_offsets() {
+    for format in ["jsonl", "csv"] {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join(format!("input.{format}"));
+        let body = if format == "csv" {
+            "topic\r\n\"a\nmultiline\"\r\nb\r\nc"
+        } else {
+            "{\"topic\":\"a\"}\n{\"topic\":\"b\"}\n{\"topic\":\"c\"}"
+        };
+        fs::write(&input, body).unwrap();
+        let mut spec = fixture(&dir, json!([]), "jsonl");
+        spec.source = if format == "csv" {
+            synthflow::spec::SourceConfig::Csv { path: input }
+        } else {
+            synthflow::spec::SourceConfig::Jsonl { path: input }
+        };
+        interrupt_after(&spec, 1, &[r#"{"answer":"a"}"#, r#"{"answer":"b"}"#]).await;
+        let before = read_manifest(&spec);
+        assert!(before.sink_state.source_byte_offset.unwrap() > 0);
+        let report = resume_with_provider(
+            &spec,
+            ScriptedProvider::answers(&[r#"{"answer":"b"}"#, r#"{"answer":"c"}"#]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(report.succeeded(), "{:?}", report.errors);
+        assert_eq!(report.statistics.source_records_total, 2);
+        assert_eq!(
+            report.sink_state.source_byte_offset,
+            Some(body.len() as u64)
+        );
+        let rows = rows_jsonl(&spec.output.path);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1]["topic"], "b");
+        assert_eq!(rows[2]["_meta"]["source_position"], 3);
+    }
+}
+
+#[tokio::test]
+async fn cancelled_rejection_ratio_can_improve_after_resume() {
+    let dir = TempDir::new().unwrap();
+    let mut spec = fixture(&dir, json!([{"topic":"a"},{"topic":"b"}]), "jsonl");
+    spec.errors.max_failed_ratio = Some(0.5);
+    let provider = ScriptedProvider::gated(
+        &["invalid", r#"{"answer":"b"}"#],
+        1,
+        dir.path().join("gate"),
+    );
+    let token = CancellationToken::new();
+    let run = run_with_provider(&spec, provider.clone(), token.clone());
+    tokio::pin!(run);
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            report = &mut run => report,
+            _ = provider.wait_until_reached() => { token.cancel(); run.await }
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(first.status, RunStatus::Cancelled);
+    assert_eq!(first.sink_state.committed_rejected_records, 1);
+    let report = resume_with_provider(
+        &spec,
+        ScriptedProvider::answers(&[r#"{"answer":"b"}"#]),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(report.succeeded(), "{:?}", report.errors);
+    assert_eq!(report.sink_state.committed_accepted_records, 1);
+}
+
+#[tokio::test]
+async fn legacy_checkpoint_without_file_offset_remains_resumable() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("input.jsonl");
+    fs::write(&path, "{\"topic\":\"a\"}\n{\"topic\":\"b\"}\n").unwrap();
+    let mut spec = fixture(&dir, json!([]), "jsonl");
+    spec.source = synthflow::spec::SourceConfig::Jsonl { path };
+    interrupt_after(&spec, 1, &[r#"{"answer":"a"}"#, r#"{"answer":"b"}"#]).await;
+    let mut prior = read_manifest(&spec);
+    prior.sink_state.source_byte_offset = None;
+    fs::write(&prior.manifest_path, serde_json::to_vec(&prior).unwrap()).unwrap();
+    let report = resume_with_provider(
+        &spec,
+        ScriptedProvider::answers(&[r#"{"answer":"b"}"#]),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(report.succeeded());
+    assert_eq!(rows_jsonl(&spec.output.path).len(), 2);
+    assert_eq!(report.statistics.source_records_total, 1);
+}
+
+#[tokio::test]
+async fn judge_reuses_the_same_configured_provider_instance() {
+    let dir = TempDir::new().unwrap();
+    let mut spec = fixture(&dir, json!([{"topic":"a"}]), "jsonl");
+    spec.judge = Some(
+        serde_json::from_value(json!({"provider":"generator","prompt":"score","min_score":0.5}))
+            .unwrap(),
+    );
+    let provider = ScriptedProvider::answers(&[r#"{"answer":"a"}"#, r#"{"score":1}"#]);
+    let report = run_with_provider(&spec, provider.clone(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(report.succeeded(), "{:?}", report.errors);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(report.statistics.latency_calls_total, 2);
+}

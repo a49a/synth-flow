@@ -25,7 +25,7 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
-    /// Continue the failed or cancelled run recorded in the output manifest.
+    /// Recover an interrupted run from its checkpoint or verified publication intent.
     Resume {
         pipeline: PathBuf,
         #[arg(long)]

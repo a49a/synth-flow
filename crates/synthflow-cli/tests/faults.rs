@@ -5,14 +5,14 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 struct StateData {
     calls: AtomicUsize,
-    block_after_first: bool,
+    block_after_first: AtomicBool,
 }
 async fn handler(
     State(state): State<Arc<StateData>>,
@@ -25,7 +25,7 @@ async fn handler(
     );
     assert_eq!(body["model"], "test-model");
     let call = state.calls.fetch_add(1, Ordering::SeqCst);
-    if state.block_after_first && call > 0 {
+    if state.block_after_first.load(Ordering::SeqCst) && call > 0 {
         std::future::pending::<()>().await;
     }
     Json(json!({"choices":[{"message":{"content":"{\"answer\":\"ok\"}"}}]}))
@@ -40,7 +40,7 @@ async fn start(
 ) {
     let state = Arc::new(StateData {
         calls: AtomicUsize::new(0),
-        block_after_first: block,
+        block_after_first: AtomicBool::new(block),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -158,9 +158,20 @@ async fn forced_termination_leaves_only_partial_and_last_durable_position() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut child, state, server) = start(dir.path(), true).await;
     wait_for_second_request(&mut child, &state).await;
+    let competitor = Command::new(env!("CARGO_BIN_EXE_synthflow"))
+        .arg("resume")
+        .arg(dir.path().join("pipeline.yaml"))
+        .env("SYNTHFLOW_TEST_KEY", "fixture-secret-key")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let refused = wait(competitor).await;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("run lock"));
     child.kill().expect("terminate process");
     let output = wait(child).await;
-    server.abort();
+
     assert!(!output.status.success());
     assert!(!dir.path().join("result.jsonl").exists());
     let manifest: Value = serde_json::from_slice(
@@ -172,6 +183,30 @@ async fn forced_termination_leaves_only_partial_and_last_durable_position() {
     let partial = fs::read_to_string(dir.path().join("result.jsonl.partial")).expect("partial");
     assert_eq!(partial.lines().count(), 1);
     assert_eq!(manifest["sink_state"]["accepted_bytes"], partial.len());
+    state.block_after_first.store(false, Ordering::SeqCst);
+    let resumed = Command::new(env!("CARGO_BIN_EXE_synthflow"))
+        .arg("resume")
+        .arg(dir.path().join("pipeline.yaml"))
+        .env("SYNTHFLOW_TEST_KEY", "fixture-secret-key")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let completed = wait(resumed).await;
+    server.abort();
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let rows: Vec<Value> = fs::read_to_string(dir.path().join("result.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["_meta"]["source_position"], 1);
+    assert_eq!(rows[1]["_meta"]["source_position"], 2);
 }
 
 #[test]

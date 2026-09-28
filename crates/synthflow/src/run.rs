@@ -30,6 +30,8 @@ pub enum RunStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SinkState {
     pub committed_source_position: u64,
+    #[serde(default)]
+    pub source_byte_offset: Option<u64>,
     pub committed_accepted_records: u64,
     pub committed_rejected_records: u64,
     pub accepted_bytes: u64,
@@ -52,6 +54,9 @@ pub struct RunReport {
     pub pipeline_version: u32,
     pub pipeline_hash: String,
     pub source_fingerprint: String,
+    /// Hash of the fully synced file recorded before linking the final path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_digest: Option<String>,
     pub started_at_unix_ms: u128,
     pub finished_at_unix_ms: Option<u128>,
     pub output_path: PathBuf,
@@ -288,6 +293,7 @@ impl Artifacts {
             pipeline_version: pipeline.version,
             pipeline_hash: pipeline.hash()?,
             source_fingerprint: fingerprint,
+            publication_digest: None,
             started_at_unix_ms: now_ms(),
             finished_at_unix_ms: None,
             output_path: output,
@@ -320,7 +326,7 @@ impl Artifacts {
         Ok((this, report))
     }
 
-    /// Continue a failed or cancelled run: truncate both files to the
+    /// Continue an interrupted run: truncate both files to the
     /// committed prefix, reopen them for appends, and start a fresh report
     /// that carries the prior committed state and provenance.
     pub fn resume(
@@ -361,6 +367,7 @@ impl Artifacts {
             pipeline_version: pipeline.version,
             pipeline_hash: pipeline.hash()?,
             source_fingerprint: fingerprint,
+            publication_digest: None,
             started_at_unix_ms: now_ms(),
             finished_at_unix_ms: None,
             output_path: output,
@@ -404,7 +411,12 @@ impl Artifacts {
         write_jsonl(&mut self.rejected, value)
     }
 
-    pub fn commit(&mut self, report: &mut RunReport, position: u64) -> Result<()> {
+    pub fn commit(
+        &mut self,
+        report: &mut RunReport,
+        position: u64,
+        source_byte_offset: Option<u64>,
+    ) -> Result<()> {
         self.rejected
             .sync_all()
             .map_err(|e| Error::io(&report.dead_letter_path, e))?;
@@ -418,6 +430,7 @@ impl Artifacts {
             .map_err(|e| Error::io(&report.partial_path, e))?;
         let next = SinkState {
             committed_source_position: position,
+            source_byte_offset,
             committed_accepted_records: report.base_accepted_records
                 + report.statistics.accepted_records_total,
             committed_rejected_records: report.base_rejected_records
@@ -451,10 +464,19 @@ impl Artifacts {
     pub fn publish(&mut self, report: &mut RunReport) -> Result<()> {
         // Parquet publishes the staged conversion; JSONL publishes the
         // partial itself. Either way the link source is fully synced first.
-        let link_source = match self.format {
-            OutputFormat::Jsonl => report.partial_path.clone(),
-            OutputFormat::Parquet => write_parquet_output(report, self.batch_size)?,
+        let staged = match self.format {
+            OutputFormat::Jsonl => None,
+            OutputFormat::Parquet => Some(write_parquet_output(report, self.batch_size)?),
         };
+        let link_source = staged
+            .as_ref()
+            .map_or_else(|| report.partial_path.clone(), |path| path.to_path_buf());
+        report.publication_digest = Some(fingerprint(
+            &SourceConfig::Jsonl {
+                path: link_source.clone(),
+            },
+            &CancellationToken::new(),
+        )?);
         report.status = RunStatus::Publishing;
         if let Err(error) = save_report(report) {
             if link_source != report.partial_path {
@@ -506,11 +528,14 @@ impl Artifacts {
 /// atomic same-directory hard link. The JSONL partial is the resume
 /// checkpoint and is never modified: a later publish failure must still be
 /// able to truncate and parse it as JSONL.
-fn write_parquet_output(report: &RunReport, batch_size: usize) -> Result<PathBuf> {
-    let staged = suffix(&report.output_path, ".publishing");
-    // An existing staged path can belong to another writer or a failed
-    // process. Never delete it implicitly.
-    let file = create_new(&staged)?;
+fn write_parquet_output(report: &RunReport, batch_size: usize) -> Result<tempfile::TempPath> {
+    // A unique conversion file makes an abandoned conversion harmless on
+    // restart. RAII removes it on every handled failure.
+    let temp = tempfile::Builder::new()
+        .prefix(".synthflow-publish-")
+        .tempfile_in(report.output_path.parent().unwrap_or(Path::new(".")))
+        .map_err(|e| Error::io(&report.output_path, e))?;
+    let (file, staged) = temp.into_parts();
     let result = (|| -> Result<()> {
         let schema = match report.sink_state.committed_accepted_records {
             0 => SchemaRef::new(arrow::datatypes::Schema::empty()),
@@ -655,6 +680,58 @@ fn sync_parent(path: &Path) -> Result<()> {
     File::open(parent)
         .and_then(|f| f.sync_all())
         .map_err(|e| Error::io(parent, e))
+}
+
+/// Called only with the namespace lock held and source/config identity checked.
+/// Complete a link made before a crash only if it matches the durable publish
+/// intent. Unknown or conflicting final files are never removed or overwritten.
+pub(crate) fn finish_interrupted_publication(
+    report: &mut RunReport,
+    cancellation: &CancellationToken,
+) -> Result<bool> {
+    if !report
+        .output_path
+        .try_exists()
+        .map_err(|e| Error::io(&report.output_path, e))?
+    {
+        return Ok(false);
+    }
+    if report.status != RunStatus::Publishing {
+        return Err(Error::Configuration(
+            "final output exists without a recoverable publication intent".into(),
+        ));
+    }
+    let expected = report.publication_digest.as_ref().ok_or_else(|| {
+        Error::Configuration(
+            "legacy publishing manifest lacks an output digest; inspect artifacts manually".into(),
+        )
+    })?;
+    let actual = fingerprint(
+        &SourceConfig::Jsonl {
+            path: report.output_path.clone(),
+        },
+        cancellation,
+    )?;
+    if actual != *expected {
+        return Err(Error::Configuration(
+            "final output does not match the recorded publication digest".into(),
+        ));
+    }
+    File::open(&report.output_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| Error::io(&report.output_path, e))?;
+    sync_parent(&report.output_path)?;
+    report.status = RunStatus::Completed;
+    report.finished_at_unix_ms = Some(now_ms());
+    save_report(report)?;
+    if report.partial_path.exists()
+        && let Err(error) = fs::remove_file(&report.partial_path).and_then(|_| {
+            File::open(report.partial_path.parent().unwrap_or(Path::new(".")))?.sync_all()
+        })
+    {
+        tracing::warn!(%error, event = "partial_cleanup_failed");
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
