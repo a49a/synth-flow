@@ -183,12 +183,19 @@ pub enum Normalize {
 pub struct Output {
     pub format: OutputFormat,
     pub path: PathBuf,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputFormat {
     Jsonl,
+    Parquet,
+}
+
+fn default_batch_size() -> usize {
+    1024
 }
 
 impl Pipeline {
@@ -404,6 +411,9 @@ impl Pipeline {
         if self.output.path.file_name().is_none() || self.output.path.is_dir() {
             return Err(invalid("output.path must name a file"));
         }
+        if self.output.batch_size == 0 || self.output.batch_size > 65536 {
+            return Err(invalid("output.batch_size must be in 1..=65536"));
+        }
         let mut ancestor = self.output.path.parent();
         while let Some(path) = ancestor {
             if path.exists() {
@@ -562,8 +572,12 @@ impl Pipeline {
             Some(DedupConfig::MinHash { .. }) => "\n  ↓\nDedupMinHash",
             None => "",
         };
+        let sink = match self.output.format {
+            OutputFormat::Jsonl => "JsonlSink",
+            OutputFormat::Parquet => "ParquetSink",
+        };
         format!(
-            "{source}\n  ↓\nPromptRender\n  ↓\nGenerate({})\n  ↓\nJsonParse\n  ↓\nSchemaValidate{regenerate}{judge}{dedup}\n  ↓\nJsonlSink",
+            "{source}\n  ↓\nPromptRender\n  ↓\nGenerate({})\n  ↓\nJsonParse\n  ↓\nSchemaValidate{regenerate}{judge}{dedup}\n  ↓\n{sink}",
             self.generate.provider
         )
     }

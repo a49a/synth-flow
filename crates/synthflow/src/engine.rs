@@ -3,7 +3,7 @@ use crate::{
     dedup::DedupState,
     provider::{GenerateRequest, LlmProvider, ProviderStatistics, create_provider},
     record::{RecordMeta, record_id},
-    run::{Artifacts, RunReport, RunStatus, fingerprint, now_ms, save_report},
+    run::{Artifacts, RunReport, RunStatus, WriteResult, fingerprint, now_ms, save_report},
     source::Source,
     template,
 };
@@ -168,7 +168,7 @@ pub async fn run_with_provider(
                     match verdict {
                         Ok(()) => {
                             let meta = RecordMeta {
-                                record_id: id, run_id: report.run_id.clone(), source_position: outcome.position,
+                                record_id: id.clone(), run_id: report.run_id.clone(), source_position: outcome.position,
                                 pipeline_hash: report.pipeline_hash.clone(), pipeline_version: pipeline.version,
                                 source_fingerprint: report.source_fingerprint.clone(),
                                 stage: "accepted", attempt: generated.attempts, generator_provider: pipeline.generate.provider.clone(), generator_model: generated.model,
@@ -178,9 +178,16 @@ pub async fn run_with_provider(
                                 judge_score: generated.judge.as_ref().map(|j| j.score),
                             };
                             input.insert("_meta".into(), serde_json::to_value(meta).map_err(|_| Error::Sink("metadata serialization failed".into()))?);
-                            artifacts.write_accepted(&Value::Object(input))?;
-                            report.statistics.accepted_records_total += 1;
-                            false
+                            match artifacts.write_accepted(outcome.position, &Value::Object(input))? {
+                                WriteResult::Written => {
+                                    report.statistics.accepted_records_total += 1;
+                                    false
+                                }
+                                WriteResult::Rejected(error) => {
+                                    write_rejection(&mut artifacts, &mut report, &id, outcome.position, &error, outcome.attempts)?;
+                                    true
+                                }
+                            }
                         }
                         Err(error) => {
                             if matches!(error, Error::Duplicate) {

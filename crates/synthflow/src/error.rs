@@ -48,6 +48,8 @@ pub enum Error {
     DedupField { field: String },
     #[error("sink error: {0}")]
     Sink(String),
+    #[error("record cannot be stored in the parquet schema: {0}")]
+    SinkRow(String),
     #[error("run cancelled")]
     Cancelled,
     #[error("failure policy exceeded: {0}")]
@@ -97,6 +99,7 @@ impl Error {
             Self::Duplicate => ("duplicate", "dedup"),
             Self::DedupField { .. } => ("dedup_field", "dedup"),
             Self::Sink(_) => ("sink", "sink"),
+            Self::SinkRow(_) => ("sink_row", "sink"),
             Self::Cancelled => ("cancelled", "run"),
             Self::FailurePolicy(_) => ("failure_policy", "run"),
             Self::RunFailed(_) => ("run", "run"),

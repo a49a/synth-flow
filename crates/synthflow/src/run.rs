@@ -2,13 +2,15 @@ use crate::{
     Error, Pipeline, Result,
     engine::RunStatistics,
     error::Diagnostic,
-    spec::{SourceConfig, normalize_path, suffix},
+    spec::{OutputFormat, SourceConfig, normalize_path, suffix},
 };
+use arrow::datatypes::SchemaRef;
+use parquet::{arrow::arrow_writer::ArrowWriter, file::properties::WriterProperties};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -93,10 +95,100 @@ pub fn fingerprint(source: &SourceConfig, cancellation: &CancellationToken) -> R
     Ok(hash.finalize().to_hex().to_string())
 }
 
+/// A record-level sink decision; parquet rows that cannot be represented in
+/// the inferred schema are rejected instead of failing the whole run.
+pub(crate) enum WriteResult {
+    Written,
+    Rejected(Error),
+}
+
+/// Parquet output always commits a JSONL partial (readable prefix, identical
+/// resume semantics) and converts it to parquet at publish time. This checker
+/// decodes every row against the schema inferred from the first record so
+/// incompatible rows are rejected at their own position.
+pub(crate) struct ParquetChecker {
+    schema: Option<SchemaRef>,
+}
+
+impl ParquetChecker {
+    fn check(&mut self, value: &Value) -> Result<WriteResult> {
+        let schema = match &self.schema {
+            Some(schema) => schema.clone(),
+            None => {
+                let schema =
+                    arrow_json::reader::infer_json_schema_from_iterator(std::iter::once(Ok(value)))
+                        .map_err(|e| {
+                            Error::Sink(format!("parquet schema inference failed: {e}"))
+                        })?;
+                let schema = SchemaRef::new(schema);
+                self.schema = Some(schema.clone());
+                schema
+            }
+        };
+        if !covers_fields(schema.fields(), value) {
+            return Ok(WriteResult::Rejected(Error::SinkRow(
+                "record contains a field outside the parquet schema".into(),
+            )));
+        }
+        let line = json_line(value)?;
+        let mut reader = arrow_json::ReaderBuilder::new(schema)
+            .with_batch_size(1)
+            .build(line.as_bytes())
+            .map_err(|e| {
+                Error::SinkRow(format!("record does not match the parquet schema: {e}"))
+            })?;
+        match reader.next() {
+            Some(Ok(_)) => Ok(WriteResult::Written),
+            Some(Err(_)) => Ok(WriteResult::Rejected(Error::SinkRow(
+                "record does not match the parquet schema".into(),
+            ))),
+            None => Ok(WriteResult::Rejected(Error::SinkRow(
+                "record could not be decoded".into(),
+            ))),
+        }
+    }
+}
+
+/// arrow-json silently drops fields that are absent from the schema, so the
+/// checker rejects such rows explicitly instead of losing data.
+fn covers_fields(fields: &arrow::datatypes::Fields, value: &Value) -> bool {
+    let Some(map) = value.as_object() else {
+        return true;
+    };
+    map.iter().all(|(key, field_value)| match fields.find(key) {
+        None => false,
+        Some((_, field)) => value_fits(field.data_type(), field_value),
+    })
+}
+
+fn value_fits(data_type: &arrow::datatypes::DataType, value: &Value) -> bool {
+    use arrow::datatypes::DataType;
+    match (data_type, value) {
+        (DataType::Struct(child), _) => covers_fields(child, value),
+        (
+            DataType::List(child) | DataType::LargeList(child) | DataType::FixedSizeList(child, _),
+            Value::Array(items),
+        ) => items.iter().all(|item| value_fits(child.data_type(), item)),
+        // Scalars are left to arrow-json's decoder, which rejects type clashes.
+        _ => true,
+    }
+}
+
+fn json_line(value: &Value) -> Result<String> {
+    let mut line = serde_json::to_string(value)
+        .map_err(|_| Error::Sink("JSON serialization failed".into()))?;
+    line.push('\n');
+    Ok(line)
+}
+
 pub(crate) struct Artifacts {
     accepted: File,
     rejected: File,
+    parquet: Option<ParquetChecker>,
+    format: OutputFormat,
+    batch_size: usize,
 }
+
 impl Artifacts {
     pub fn create(pipeline: &Pipeline, fingerprint: String) -> Result<(Self, RunReport)> {
         let output = normalize_path(&pipeline.output.path)?;
@@ -154,10 +246,14 @@ impl Artifacts {
             statistics: RunStatistics::default(),
             errors: Vec::new(),
         };
-        let this = Self { accepted, rejected };
-        this.accepted
-            .sync_all()
-            .map_err(|e| Error::io(&report.partial_path, e))?;
+        let this = Self {
+            accepted,
+            rejected,
+            parquet: matches!(pipeline.output.format, OutputFormat::Parquet)
+                .then_some(ParquetChecker { schema: None }),
+            format: pipeline.output.format.clone(),
+            batch_size: pipeline.output.batch_size,
+        };
         this.rejected
             .sync_all()
             .map_err(|e| Error::io(&report.dead_letter_path, e))?;
@@ -166,20 +262,32 @@ impl Artifacts {
         save_report(&report)?;
         Ok((this, report))
     }
-    pub fn write_accepted(&mut self, value: &Value) -> Result<()> {
-        write_jsonl(&mut self.accepted, value)
+
+    pub fn write_accepted(&mut self, _position: u64, value: &Value) -> Result<WriteResult> {
+        if let Some(checker) = &mut self.parquet
+            && let WriteResult::Rejected(error) = checker.check(value)?
+        {
+            return Ok(WriteResult::Rejected(error));
+        }
+        write_jsonl(&mut self.accepted, value)?;
+        Ok(WriteResult::Written)
     }
     pub fn write_rejected(&mut self, value: &Value) -> Result<()> {
         write_jsonl(&mut self.rejected, value)
     }
 
     pub fn commit(&mut self, report: &mut RunReport, position: u64) -> Result<()> {
-        self.accepted
-            .sync_all()
-            .map_err(|e| Error::io(&report.partial_path, e))?;
         self.rejected
             .sync_all()
             .map_err(|e| Error::io(&report.dead_letter_path, e))?;
+        let rejected_bytes = self
+            .rejected
+            .metadata()
+            .map_err(|e| Error::io(&report.dead_letter_path, e))?
+            .len();
+        self.accepted
+            .sync_all()
+            .map_err(|e| Error::io(&report.partial_path, e))?;
         let next = SinkState {
             committed_source_position: position,
             committed_accepted_records: report.statistics.accepted_records_total,
@@ -189,11 +297,7 @@ impl Artifacts {
                 .metadata()
                 .map_err(|e| Error::io(&report.partial_path, e))?
                 .len(),
-            rejected_bytes: self
-                .rejected
-                .metadata()
-                .map_err(|e| Error::io(&report.dead_letter_path, e))?
-                .len(),
+            rejected_bytes,
         };
         // Both data files are durable. If manifest rename succeeds but directory
         // sync fails, it may already reference `next`: never truncate below it.
@@ -214,7 +318,10 @@ impl Artifacts {
         Ok(())
     }
 
-    pub fn publish(&self, report: &mut RunReport) -> Result<()> {
+    pub fn publish(&mut self, report: &mut RunReport) -> Result<()> {
+        if matches!(self.format, OutputFormat::Parquet) {
+            write_parquet_output(report, self.batch_size)?;
+        }
         report.status = RunStatus::Publishing;
         save_report(report)?;
         // Same-directory hard link publishes a fully synced file atomically and
@@ -240,6 +347,66 @@ impl Artifacts {
         }
         Ok(())
     }
+}
+
+/// Convert the durable JSONL partial into the final parquet file. The
+/// temporary conversion lives next to the output so publication is still an
+/// atomic same-directory hard link.
+fn write_parquet_output(report: &RunReport, batch_size: usize) -> Result<()> {
+    let staged = suffix(&report.output_path, ".publishing");
+    let file = create_new(&staged)?;
+    let schema = match report.sink_state.committed_accepted_records {
+        0 => SchemaRef::new(arrow::datatypes::Schema::empty()),
+        _ => {
+            let partial =
+                File::open(&report.partial_path).map_err(|e| Error::io(&report.partial_path, e))?;
+            let lines = std::io::BufReader::new(partial).lines().map(|line| {
+                let line =
+                    line.map_err(|e| arrow_schema::ArrowError::ExternalError(Box::new(e)))?;
+                serde_json::from_str::<Value>(&line).map_err(|e| {
+                    arrow_schema::ArrowError::ExternalError(Box::new(std::io::Error::other(
+                        format!("partial row is not valid JSON: {e}"),
+                    )))
+                })
+            });
+            let schema = arrow_json::reader::infer_json_schema_from_iterator(lines)
+                .map_err(|e| Error::Sink(format!("parquet schema inference failed: {e}")))?;
+            SchemaRef::new(schema)
+        }
+    };
+    let result = (|| -> Result<()> {
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(batch_size.max(1)))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(properties))
+            .map_err(|e| Error::Sink(format!("parquet writer init failed: {e}")))?;
+        let partial =
+            File::open(&report.partial_path).map_err(|e| Error::io(&report.partial_path, e))?;
+        let mut reader = arrow_json::ReaderBuilder::new(schema)
+            .with_batch_size(batch_size.max(1))
+            .build(std::io::BufReader::new(partial))
+            .map_err(|e| Error::Sink(format!("parquet conversion failed: {e}")))?;
+        while let Some(batch) = reader
+            .next()
+            .transpose()
+            .map_err(|e| Error::Sink(format!("parquet conversion failed: {e}")))?
+        {
+            writer
+                .write(&batch)
+                .map_err(|e| Error::Sink(format!("parquet write failed: {e}")))?;
+        }
+        writer
+            .close()
+            .map_err(|e| Error::Sink(format!("parquet close failed: {e}")))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    // The staged file replaces the hard-link source for publication.
+    fs::rename(&staged, &report.partial_path).map_err(|e| Error::io(&report.partial_path, e))?;
+    sync_parent(&report.partial_path)
 }
 
 fn create_directory_durable(path: &Path) -> Result<()> {
