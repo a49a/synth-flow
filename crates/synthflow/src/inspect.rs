@@ -23,6 +23,9 @@ pub struct ColumnStats {
     pub data_type: String,
     pub count: u64,
     pub null_count: u64,
+    /// Numeric summary over the numeric values only; non-numeric values in a
+    /// mixed column are excluded, never counted as zero. `None` when the
+    /// column contains no numbers.
     pub min: Option<f64>,
     pub max: Option<f64>,
     pub mean: Option<f64>,
@@ -119,7 +122,8 @@ impl Accumulator {
                     null_count: self.rows.saturating_sub(column.count),
                     min: column.min,
                     max: column.max,
-                    mean: (column.min.is_some()).then(|| column.sum / column.count as f64),
+                    mean: (column.numeric_count > 0)
+                        .then(|| column.sum / column.numeric_count as f64),
                     distinct: (!column.distinct_capped).then_some(column.distinct.len() as u64),
                 })
                 .collect(),
@@ -131,6 +135,7 @@ impl Accumulator {
 struct ColumnAccumulator {
     types: HashSet<&'static str>,
     count: u64,
+    numeric_count: u64,
     min: Option<f64>,
     max: Option<f64>,
     sum: f64,
@@ -146,6 +151,7 @@ impl ColumnAccumulator {
         self.count += 1;
         self.types.insert(type_name(value));
         if let Some(number) = value.as_f64() {
+            self.numeric_count += 1;
             self.min = Some(self.min.map_or(number, |min| min.min(number)));
             self.max = Some(self.max.map_or(number, |max| max.max(number)));
             self.sum += number;

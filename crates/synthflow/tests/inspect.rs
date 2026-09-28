@@ -81,6 +81,17 @@ fn mixed_types_and_unsupported_extensions_are_reported() {
     std::fs::write(&data, "{\"a\": 1}\n{\"a\": \"one\"}\n").expect("write");
     let summary = summarize(&data).expect("summary");
     assert_eq!(column(&summary, "a").data_type, "mixed");
+    assert_eq!(column(&summary, "a").mean, Some(1.0));
+    assert_eq!(column(&summary, "a").min, Some(1.0));
+    assert_eq!(column(&summary, "a").max, Some(1.0));
+
+    let nulls = dir.path().join("nulls.jsonl");
+    std::fs::write(&nulls, "{\"a\":null,\"b\":\"text\"}\n{}\n").expect("write");
+    let summary = summarize(&nulls).expect("summary");
+    assert_eq!(column(&summary, "a").mean, None);
+    assert_eq!(column(&summary, "a").null_count, 2);
+    assert_eq!(column(&summary, "b").mean, None);
+    assert_eq!(column(&summary, "b").null_count, 1);
 
     let other = dir.path().join("data.csv");
     assert!(summarize(&other).is_err());
