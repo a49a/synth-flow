@@ -1,0 +1,35 @@
+version: 1
+dataset:
+  name: rust_instruction
+source:
+  type: jsonl
+  path: topics.jsonl
+providers:
+  generator:
+    type: mock
+    # The mock renders a deterministic response; it never calls a network API.
+    response: |
+      {
+        "question": {{ ("Explain Rust " ~ record.topic ~ ".") | tojson }},
+        "answer": {{ record.summary | tojson }},
+        "difficulty": "easy",
+        "prompt_hash": {{ prompt_hash | tojson }}
+      }
+generate:
+  provider: generator
+  prompt: |
+    Create one Rust interview question about {{ record.topic }}.
+    Return JSON only.
+  output_schema:
+    type: object
+    additionalProperties: false
+    required: [question, answer, difficulty, prompt_hash]
+    properties:
+      question: {type: string, minLength: 1}
+      answer: {type: string, minLength: 1}
+      difficulty: {enum: [easy, medium, hard]}
+      prompt_hash: {type: string}
+output:
+  format: jsonl
+  path: output/rust_instruction.jsonl
+

@@ -1,0 +1,34 @@
+version: 1
+dataset: {name: rust_http}
+source:
+  type: jsonl
+  path: topics.jsonl
+providers:
+  generator:
+    type: openai_compatible
+    base_url: http://127.0.0.1:8000/v1
+    model: local-model
+    # api_key_env: LOCAL_LLM_API_KEY
+    concurrency: 4
+    timeout_ms: 60000
+    retry:
+      max_attempts: 5
+      initial_delay_ms: 500
+      max_delay_ms: 30000
+generate:
+  provider: generator
+  prompt: |
+    Create a Rust interview question about {{ record.topic }}.
+    Return JSON only with string fields question and answer.
+  output_schema:
+    type: object
+    required: [question, answer]
+    properties:
+      question: {type: string}
+      answer: {type: string}
+errors:
+  max_failed_records: 10
+  max_failed_ratio: 0.2
+output:
+  format: jsonl
+  path: output/rust_http.jsonl

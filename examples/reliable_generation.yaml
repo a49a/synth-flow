@@ -1,0 +1,28 @@
+version: 1
+dataset: {name: reliable_demo}
+source:
+  type: inline
+  records:
+    - {topic: ownership, answer: 'Each value has one owner.'}
+    - {topic: borrowing, answer: 42} # Deliberate schema failure to demonstrate diagnostics.
+    - {topic: traits, answer: 'Traits define shared behavior.'}
+providers:
+  generator:
+    type: mock
+    concurrency: 2
+    response: '{"answer": {{ record.answer | tojson }}}'
+generate:
+  provider: generator
+  prompt: 'Explain Rust {{ record.topic }}.'
+  output_schema:
+    type: object
+    required: [answer]
+    properties:
+      answer: {type: string}
+errors:
+  max_failed_records: 1
+  max_failed_ratio: 0.5
+  strict: false
+output:
+  format: jsonl
+  path: output/reliable_demo.jsonl

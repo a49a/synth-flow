@@ -1,0 +1,24 @@
+version: 1
+dataset:
+  name: inline_demo
+source:
+  type: inline
+  records:
+    - {topic: ownership}
+    - {topic: lifetimes}
+providers:
+  generator:
+    type: mock
+    response: '{"question": {{ prompt | tojson }}}'
+generate:
+  provider: generator
+  prompt: 'What is {{ topic }} in Rust?'
+  output_schema:
+    type: object
+    required: [question]
+    properties:
+      question: {type: string}
+output:
+  format: jsonl
+  path: output/inline.jsonl
+
