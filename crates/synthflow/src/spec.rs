@@ -27,6 +27,8 @@ pub struct Pipeline {
     pub dedup: Option<DedupConfig>,
     pub output: Output,
     #[serde(default)]
+    pub pricing: Option<PricingConfig>,
+    #[serde(default)]
     pub errors: ErrorPolicy,
 }
 
@@ -65,6 +67,14 @@ pub enum ProviderConfig {
         #[serde(default)]
         rate_limit: Option<RateLimitConfig>,
     },
+}
+
+/// USD per one million tokens; reports carry an estimated cost.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PricingConfig {
+    pub input_usd_per_mtok: f64,
+    pub output_usd_per_mtok: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -423,6 +433,13 @@ impl Pipeline {
                 break;
             }
             ancestor = path.parent();
+        }
+        if let Some(pricing) = &self.pricing
+            && [pricing.input_usd_per_mtok, pricing.output_usd_per_mtok]
+                .into_iter()
+                .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(invalid("pricing values must be finite and non-negative"));
         }
         if self
             .errors

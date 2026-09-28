@@ -24,6 +24,10 @@ pub struct RunStatistics {
     #[serde(default)]
     pub regeneration_attempts_total: u64,
     #[serde(default)]
+    pub prompt_tokens_total: u64,
+    #[serde(default)]
+    pub completion_tokens_total: u64,
+    #[serde(default)]
     pub judge_requests_total: u64,
     #[serde(default)]
     pub judge_rejected_total: u64,
@@ -38,7 +42,21 @@ pub struct RunStatistics {
     pub rejected_records_total: u64,
     pub elapsed_seconds: f64,
     pub records_per_second: f64,
+    #[serde(default)]
+    pub latency: LatencySummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
     pub provider_usage: ProviderStatistics,
+}
+
+/// Generation wall-clock percentiles in milliseconds over accepted and
+/// rejected calls alike; zeros when nothing reached a provider.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct LatencySummary {
+    pub mean_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
 }
 impl RunStatistics {
     fn merge(&mut self, other: &Self) {
@@ -46,6 +64,8 @@ impl RunStatistics {
         self.generation_success_total += other.generation_success_total;
         self.generation_failed_total += other.generation_failed_total;
         self.regeneration_attempts_total += other.regeneration_attempts_total;
+        self.prompt_tokens_total += other.prompt_tokens_total;
+        self.completion_tokens_total += other.completion_tokens_total;
         self.judge_requests_total += other.judge_requests_total;
         self.judge_rejected_total += other.judge_rejected_total;
         self.judge_failed_total += other.judge_failed_total;
@@ -267,6 +287,9 @@ async fn execute(
     let mut pending = FuturesOrdered::new();
     let mut source_done = false;
     let mut source_error = None;
+    let mut latencies: Vec<f64> = Vec::new();
+    let mut progress_at = started;
+    let mut progress_count = 0u64;
     let result = async {
         loop {
             if cancellation.is_cancelled() { return Err(Error::Cancelled); }
@@ -297,6 +320,9 @@ async fn execute(
             if matches!(outcome.result, Err(Error::Cancelled)) { return Err(Error::Cancelled); }
             report.statistics.merge(&outcome.statistics);
             report.statistics.processed_records_total += 1;
+            if outcome.latency_ms > 0.0 {
+                latencies.push(outcome.latency_ms);
+            }
             let mut input = outcome.data.as_object().cloned().ok_or_else(|| Error::Source { position: outcome.position, message: "expected object".into() })?;
             let id = record_id(&input, outcome.position);
             let rejected = match outcome.result {
@@ -350,8 +376,21 @@ async fn execute(
                     true
                 }
             };
-            refresh(&mut report, started, provider.as_ref());
+            refresh(&mut report, started, provider.as_ref(), pipeline, &latencies);
             artifacts.commit(&mut report, outcome.position)?;
+            if report.statistics.processed_records_total - progress_count >= 500
+                || progress_at.elapsed() >= std::time::Duration::from_secs(2)
+            {
+                tracing::info!(
+                    processed = report.statistics.processed_records_total,
+                    accepted = report.statistics.accepted_records_total,
+                    rejected = report.statistics.rejected_records_total,
+                    rate = report.statistics.records_per_second,
+                    event = "progress"
+                );
+                progress_count = report.statistics.processed_records_total;
+                progress_at = Instant::now();
+            }
             if rejected && pipeline.errors.strict { return Err(Error::FailurePolicy("strict mode rejects any failed record".into())); }
             if pipeline.errors.max_failed_records.is_some_and(|max| report.base_rejected_records + report.statistics.rejected_records_total > max) {
                 return Err(Error::FailurePolicy("max_failed_records exceeded".into()));
@@ -377,7 +416,13 @@ async fn execute(
         Ok(())
     }.await;
     drop(pending); // Cancels in-flight HTTP work without detached tasks.
-    refresh(&mut report, started, provider.as_ref());
+    refresh(
+        &mut report,
+        started,
+        provider.as_ref(),
+        pipeline,
+        &latencies,
+    );
     report.finished_at_unix_ms = Some(now_ms());
     let result = result.and_then(|()| artifacts.publish(&mut report));
     if let Err(error) = result {
@@ -429,11 +474,41 @@ fn write_rejection(
     Ok(())
 }
 
-fn refresh(report: &mut RunReport, started: Instant, provider: &dyn LlmProvider) {
+fn refresh(
+    report: &mut RunReport,
+    started: Instant,
+    provider: &dyn LlmProvider,
+    pipeline: &Pipeline,
+    latencies: &[f64],
+) {
     report.statistics.elapsed_seconds = started.elapsed().as_secs_f64();
     report.statistics.records_per_second = report.statistics.processed_records_total as f64
         / report.statistics.elapsed_seconds.max(f64::EPSILON);
     report.statistics.provider_usage = provider.statistics();
+    report.statistics.latency = summarize(latencies);
+    if let Some(pricing) = &pipeline.pricing {
+        report.statistics.estimated_cost_usd = Some(
+            (report.statistics.prompt_tokens_total as f64 * pricing.input_usd_per_mtok
+                + report.statistics.completion_tokens_total as f64 * pricing.output_usd_per_mtok)
+                / 1_000_000.0,
+        );
+    }
+}
+
+/// Nearest-rank percentiles over the recorded generation latencies.
+fn summarize(latencies: &[f64]) -> LatencySummary {
+    if latencies.is_empty() {
+        return LatencySummary::default();
+    }
+    let mut sorted = latencies.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite latencies"));
+    let pick = |fraction: f64| sorted[((sorted.len() - 1) as f64 * fraction).round() as usize];
+    LatencySummary {
+        mean_ms: sorted.iter().sum::<f64>() / sorted.len() as f64,
+        p50_ms: pick(0.50),
+        p95_ms: pick(0.95),
+        p99_ms: pick(0.99),
+    }
 }
 
 async fn source_fingerprint(
@@ -497,6 +572,7 @@ struct Outcome {
     result: Result<Generated>,
     statistics: RunStatistics,
     attempts: u32,
+    latency_ms: f64,
 }
 struct StageTools<'a> {
     env: &'a minijinja::Environment<'a>,
@@ -513,6 +589,7 @@ async fn process(
 ) -> Outcome {
     let mut statistics = RunStatistics::default();
     let mut attempts = 0;
+    let mut latency_ms = 0.0f64;
     let result = async {
         let mut context = data.as_object().cloned().unwrap_or_default();
         context.insert("record".into(), data.clone());
@@ -524,6 +601,7 @@ async fn process(
         let mut regenerations = 0;
         loop {
             statistics.generation_requests_total += 1;
+            let call = Instant::now();
             let response = tools
                 .provider
                 .generate(
@@ -539,6 +617,9 @@ async fn process(
                 .inspect_err(|_| {
                     statistics.generation_failed_total += 1;
                 })?;
+            latency_ms += call.elapsed().as_secs_f64() * 1000.0;
+            statistics.prompt_tokens_total += response.prompt_tokens.unwrap_or(0);
+            statistics.completion_tokens_total += response.completion_tokens.unwrap_or(0);
             statistics.generation_success_total += 1;
             attempts += response.attempts.max(1);
             let structured = serde_json::from_str::<Value>(&response.text)
@@ -599,6 +680,7 @@ async fn process(
         result,
         statistics,
         attempts,
+        latency_ms,
     }
 }
 
@@ -645,6 +727,8 @@ async fn judge_record(
         .inspect_err(|_| {
             statistics.judge_failed_total += 1;
         })?;
+    statistics.prompt_tokens_total += response.prompt_tokens.unwrap_or(0);
+    statistics.completion_tokens_total += response.completion_tokens.unwrap_or(0);
     let verdict = serde_json::from_str::<Value>(&response.text)
         .map_err(|_| {
             statistics.judge_failed_total += 1;
