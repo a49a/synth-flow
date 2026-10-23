@@ -1,0 +1,37 @@
+version: 1
+dataset:
+  name: explicit_parquet_schema
+source:
+  type: inline
+  records:
+    - {topic: ownership, count: null, tags: []}
+    - {topic: borrowing, count: 2, tags: [rust, safety]}
+providers:
+  generator:
+    type: mock
+    response: '{"answer": {{ record.topic | tojson }}}'
+generate:
+  provider: generator
+  prompt: 'Explain {{ record.topic }}'
+  output_schema:
+    type: object
+    required: [answer]
+    properties:
+      answer: {type: string}
+output:
+  format: parquet
+  path: output/explicit_schema.parquet
+  schema:
+    type: object
+    required: [topic, generated]
+    properties:
+      topic: {type: string}
+      count: {type: [integer, "null"]}
+      tags:
+        type: array
+        items: {type: string}
+      generated:
+        type: object
+        required: [answer]
+        properties:
+          answer: {type: string}

@@ -1,0 +1,422 @@
+{
+  "schema_version": 2,
+  "started_at_utc": "2026-10-22T11:31:30.249850+00:00",
+  "environment": {
+    "system": "Darwin",
+    "os_release": "23.6.0",
+    "os_version": "Darwin Kernel Version 23.6.0: Tue Jul 21 21:57:26 PDT 2026; root:xnu-10063.141.1.713.39~1/RELEASE_ARM64_T6000",
+    "architecture": "arm64",
+    "cpu_model": "Apple M1 Pro",
+    "logical_cpus": 10,
+    "memory_bytes": 34359738368,
+    "python": "3.10.9",
+    "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)\nbinary: rustc\ncommit-hash: 01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf\ncommit-date: 2026-02-11\nhost: aarch64-apple-darwin\nrelease: 1.93.1\nLLVM version: 21.1.8",
+    "cargo": "cargo 1.93.1 (083ac5135 2025-12-15)",
+    "binary": "/Users/ada/src/synth-flow/target/release/synthflow",
+    "binary_bytes": 22808192,
+    "binary_sha256": "cb34f80d72c8a1b04d6ad36ebd95e8a82de32287e685e016c578cb1fa532a60c",
+    "binary_modified_at_utc": "2026-10-22T11:29:58.282673+00:00",
+    "build_profile_hint": "release",
+    "git_revision": "b370a4c7be912b5f5e0a3370fa7e45f5b12e089f",
+    "git_status": "M .github/workflows/ci.yml\n M .gitignore\n M Cargo.lock\n M Cargo.toml\n M IMPLEMENTATION.md\n M README.md\n M SYNTHFLOW_DESIGN.md\n M crates/synthflow-cli/Cargo.toml\n M crates/synthflow-cli/src/main.rs\n M crates/synthflow-cli/tests/faults.rs\n M crates/synthflow/Cargo.toml\n M crates/synthflow/src/dedup.rs\n M crates/synthflow/src/engine.rs\n M crates/synthflow/src/error.rs\n M crates/synthflow/src/inspect.rs\n M crates/synthflow/src/lib.rs\n M crates/synthflow/src/provider.rs\n M crates/synthflow/src/ratelimit.rs\n M crates/synthflow/src/run.rs\n M crates/synthflow/src/source.rs\n M crates/synthflow/src/spec.rs\n M crates/synthflow/tests/dedup.rs\n M crates/synthflow/tests/inspect.rs\n M crates/synthflow/tests/metrics.rs\n M crates/synthflow/tests/minhash.rs\n M crates/synthflow/tests/parquet.rs\n M crates/synthflow/tests/pipeline.rs\n M crates/synthflow/tests/reliability.rs\n M crates/synthflow/tests/remediation.rs\n M crates/synthflow/tests/resume.rs\n M docs/GLOSSARY.md\n M docs/LABS.md\n M docs/README.md\n M docs/TEACHING_GUIDE.md\n M examples/openai_generation.yaml\n?? .github/workflows/release.yml\n?? crates/synthflow-cli/README.md\n?? crates/synthflow/README.md\n?? crates/synthflow/src/blocking.rs\n?? crates/synthflow/src/parquet_schema.rs\n?? crates/synthflow/src/progress.rs\n?? crates/synthflow/src/storage_worker.rs\n?? crates/synthflow/tests/finalization.rs\n?? crates/synthflow/tests/io_workers.rs\n?? crates/synthflow/tests/provider_http.rs\n?? docs/PARQUET_SCHEMA.md\n?? docs/PERFORMANCE.md\n?? docs/RELEASING.md\n?? docs/STATUS.md\n?? docs/benchmarks/\n?? examples/parquet_explicit_schema.yaml\n?? scripts/",
+    "cargo_lock_sha256": "8f8f197dafa5a91dc7480dff70c8e35ca79cbca961235bff9ea6777547d4344f",
+    "benchmark_sha256": "bb466d3805a61af303f00853cb032c10bf756fa541fea14bb8bf358d3e45714f",
+    "temporary_parent": "/var/folders/7_/4f432f9s1vsdhs_s2nyd436m0000gn/T/synthflow-recovery-owned-sbjh5y1l"
+  },
+  "platform": "darwin",
+  "binary": "/Users/ada/src/synth-flow/target/release/synthflow",
+  "settings": {
+    "records": [
+      10000
+    ],
+    "cases": [
+      "jsonl",
+      "exact-disk",
+      "minhash-disk",
+      "parquet"
+    ],
+    "commit_intervals": [
+      128
+    ],
+    "concurrency": [
+      8
+    ],
+    "repeat": 1,
+    "dedup_max_bytes": 67108864,
+    "text_bytes": 64,
+    "timeout_seconds": 3600,
+    "recovery": true,
+    "recovery_timeout_seconds": 120.0,
+    "recovery_after": 256
+  },
+  "measurements": [
+    {
+      "case": "jsonl",
+      "records": 10000,
+      "commit_every": 128,
+      "concurrency": 8,
+      "repeat": 1,
+      "status": "completed",
+      "run_seconds": 2.0225472080055624,
+      "peak_rss_bytes": 18300928,
+      "returncode": 0,
+      "timed_out": false,
+      "sink_state": {
+        "committed_source_position": 10000,
+        "source_byte_offset": 948894,
+        "committed_accepted_records": 10000,
+        "committed_rejected_records": 0,
+        "accepted_bytes": 7437788,
+        "rejected_bytes": 0,
+        "accepted_digest": "6a93359f891896a1cc6c1a4a55482fb1ec527e646b6f949e1c31e410a7a48a94",
+        "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      },
+      "report_errors": [],
+      "verification": {
+        "method": "streamed_jsonl_rows",
+        "rows": 10000,
+        "order_and_content": true
+      },
+      "records_per_second": 4944.2603665409715,
+      "recovery": {
+        "signal": "SIGKILL",
+        "interrupted_after_seconds": 0.083484833012335,
+        "observed_before_kill": 256,
+        "checkpoint": {
+          "committed_source_position": 256,
+          "source_byte_offset": 23956,
+          "committed_accepted_records": 256,
+          "committed_rejected_records": 0,
+          "accepted_bytes": 189736,
+          "rejected_bytes": 0,
+          "accepted_digest": "1b49f5fc6954563d1edf8b62f210044e678eaf83b00f6e965cf76a49096a5fbb",
+          "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        },
+        "resume_from": 256,
+        "resume_seconds": 1.9112533340230584,
+        "resume_peak_rss_bytes": 18169856,
+        "verification": {
+          "method": "streamed_jsonl_rows",
+          "rows": 10000,
+          "order_and_content": true
+        }
+      }
+    },
+    {
+      "case": "exact-disk",
+      "records": 10000,
+      "commit_every": 128,
+      "concurrency": 8,
+      "repeat": 1,
+      "status": "completed",
+      "run_seconds": 2.1965018330374733,
+      "peak_rss_bytes": 20086784,
+      "returncode": 0,
+      "timed_out": false,
+      "sink_state": {
+        "committed_source_position": 10000,
+        "source_byte_offset": 948894,
+        "committed_accepted_records": 10000,
+        "committed_rejected_records": 0,
+        "accepted_bytes": 7437788,
+        "rejected_bytes": 0,
+        "accepted_digest": "8e454e40d3338debad1930a44412d61944d62f7ba0506d47e64f5c687a9b5479",
+        "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      },
+      "report_errors": [],
+      "verification": {
+        "method": "streamed_jsonl_rows",
+        "rows": 10000,
+        "order_and_content": true
+      },
+      "records_per_second": 4552.693673909352,
+      "recovery": {
+        "signal": "SIGKILL",
+        "interrupted_after_seconds": 0.09127308300230652,
+        "observed_before_kill": 256,
+        "checkpoint": {
+          "committed_source_position": 256,
+          "source_byte_offset": 23956,
+          "committed_accepted_records": 256,
+          "committed_rejected_records": 0,
+          "accepted_bytes": 189736,
+          "rejected_bytes": 0,
+          "accepted_digest": "3e64b2127a85847319d1f94e657f4fc84cca9e8c2fe0518d9d92f20b48fb27fb",
+          "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        },
+        "resume_from": 256,
+        "resume_seconds": 2.1878049169899896,
+        "resume_peak_rss_bytes": 20185088,
+        "verification": {
+          "method": "streamed_jsonl_rows",
+          "rows": 10000,
+          "order_and_content": true
+        }
+      }
+    },
+    {
+      "case": "minhash-disk",
+      "records": 10000,
+      "commit_every": 128,
+      "concurrency": 8,
+      "repeat": 1,
+      "status": "completed",
+      "run_seconds": 3.7062296249787323,
+      "peak_rss_bytes": 22790144,
+      "returncode": 0,
+      "timed_out": false,
+      "sink_state": {
+        "committed_source_position": 10000,
+        "source_byte_offset": 948894,
+        "committed_accepted_records": 10000,
+        "committed_rejected_records": 0,
+        "accepted_bytes": 7437788,
+        "rejected_bytes": 0,
+        "accepted_digest": "b67885e705774198bba5a3401a3e7a2483a2a0e21a83e5a10bbe19d2352bb721",
+        "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      },
+      "report_errors": [],
+      "verification": {
+        "method": "streamed_jsonl_rows",
+        "rows": 10000,
+        "order_and_content": true
+      },
+      "records_per_second": 2698.1598583647888,
+      "recovery": {
+        "signal": "SIGKILL",
+        "interrupted_after_seconds": 0.12309908395400271,
+        "observed_before_kill": 256,
+        "checkpoint": {
+          "committed_source_position": 256,
+          "source_byte_offset": 23956,
+          "committed_accepted_records": 256,
+          "committed_rejected_records": 0,
+          "accepted_bytes": 189736,
+          "rejected_bytes": 0,
+          "accepted_digest": "ca3ad31689ac6c59dd65c5b3d0a3d0929d6fbef307474c68f25f8004a86ce9fb",
+          "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        },
+        "resume_from": 256,
+        "resume_seconds": 3.7122626670170575,
+        "resume_peak_rss_bytes": 22921216,
+        "verification": {
+          "method": "streamed_jsonl_rows",
+          "rows": 10000,
+          "order_and_content": true
+        }
+      }
+    },
+    {
+      "case": "parquet",
+      "records": 10000,
+      "commit_every": 128,
+      "concurrency": 8,
+      "repeat": 1,
+      "status": "completed",
+      "run_seconds": 2.141562041011639,
+      "peak_rss_bytes": 27754496,
+      "returncode": 0,
+      "timed_out": false,
+      "sink_state": {
+        "committed_source_position": 10000,
+        "source_byte_offset": 948894,
+        "committed_accepted_records": 10000,
+        "committed_rejected_records": 0,
+        "accepted_bytes": 7437788,
+        "rejected_bytes": 0,
+        "accepted_digest": "dbeb141fac3d3522c2ba76bcdfa93f8b4ab456b646c12cc9929ee079da2fb584",
+        "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      },
+      "report_errors": [],
+      "verification": {
+        "method": "streamed_parquet_inspect",
+        "rows": 10000,
+        "order_and_content": false,
+        "ordinal": {
+          "name": "ordinal",
+          "data_type": "number",
+          "count": 10000,
+          "null_count": 0,
+          "min": 1,
+          "max": 10000,
+          "mean": 5000.5,
+          "distinct": 10000
+        }
+      },
+      "records_per_second": 4669.488816339013,
+      "recovery": {
+        "signal": "SIGKILL",
+        "interrupted_after_seconds": 0.09236483299173415,
+        "observed_before_kill": 256,
+        "checkpoint": {
+          "committed_source_position": 256,
+          "source_byte_offset": 23956,
+          "committed_accepted_records": 256,
+          "committed_rejected_records": 0,
+          "accepted_bytes": 189736,
+          "rejected_bytes": 0,
+          "accepted_digest": "27b71453a981e26e78ef109f29fc24d11e48488bc09cdb53f7e7fc63006baf62",
+          "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        },
+        "resume_from": 256,
+        "resume_seconds": 2.042429084016476,
+        "resume_peak_rss_bytes": 27377664,
+        "verification": {
+          "method": "streamed_parquet_inspect",
+          "rows": 10000,
+          "order_and_content": false,
+          "ordinal": {
+            "name": "ordinal",
+            "data_type": "number",
+            "count": 10000,
+            "null_count": 0,
+            "min": 1,
+            "max": 10000,
+            "mean": 5000.5,
+            "distinct": 10000
+          }
+        }
+      }
+    }
+  ],
+  "summary": [
+    {
+      "case": "jsonl",
+      "records": 10000,
+      "commit_every": 128,
+      "concurrency": 8,
+      "samples": 1,
+      "successful": 1,
+      "failed": 0,
+      "run_seconds": {
+        "median": 2.0225472080055624,
+        "p95": 2.0225472080055624,
+        "max": 2.0225472080055624
+      },
+      "records_per_second": {
+        "median": 4944.2603665409715,
+        "p95": 4944.2603665409715,
+        "max": 4944.2603665409715
+      },
+      "peak_rss_bytes": {
+        "median": 18300928,
+        "p95": 18300928.0,
+        "max": 18300928
+      },
+      "resume_seconds": {
+        "median": 1.9112533340230584,
+        "p95": 1.9112533340230584,
+        "max": 1.9112533340230584
+      },
+      "resume_peak_rss_bytes": {
+        "median": 18169856,
+        "p95": 18169856.0,
+        "max": 18169856
+      }
+    },
+    {
+      "case": "exact-disk",
+      "records": 10000,
+      "commit_every": 128,
+      "concurrency": 8,
+      "samples": 1,
+      "successful": 1,
+      "failed": 0,
+      "run_seconds": {
+        "median": 2.1965018330374733,
+        "p95": 2.1965018330374733,
+        "max": 2.1965018330374733
+      },
+      "records_per_second": {
+        "median": 4552.693673909352,
+        "p95": 4552.693673909352,
+        "max": 4552.693673909352
+      },
+      "peak_rss_bytes": {
+        "median": 20086784,
+        "p95": 20086784.0,
+        "max": 20086784
+      },
+      "resume_seconds": {
+        "median": 2.1878049169899896,
+        "p95": 2.1878049169899896,
+        "max": 2.1878049169899896
+      },
+      "resume_peak_rss_bytes": {
+        "median": 20185088,
+        "p95": 20185088.0,
+        "max": 20185088
+      }
+    },
+    {
+      "case": "minhash-disk",
+      "records": 10000,
+      "commit_every": 128,
+      "concurrency": 8,
+      "samples": 1,
+      "successful": 1,
+      "failed": 0,
+      "run_seconds": {
+        "median": 3.7062296249787323,
+        "p95": 3.7062296249787323,
+        "max": 3.7062296249787323
+      },
+      "records_per_second": {
+        "median": 2698.1598583647888,
+        "p95": 2698.1598583647888,
+        "max": 2698.1598583647888
+      },
+      "peak_rss_bytes": {
+        "median": 22790144,
+        "p95": 22790144.0,
+        "max": 22790144
+      },
+      "resume_seconds": {
+        "median": 3.7122626670170575,
+        "p95": 3.7122626670170575,
+        "max": 3.7122626670170575
+      },
+      "resume_peak_rss_bytes": {
+        "median": 22921216,
+        "p95": 22921216.0,
+        "max": 22921216
+      }
+    },
+    {
+      "case": "parquet",
+      "records": 10000,
+      "commit_every": 128,
+      "concurrency": 8,
+      "samples": 1,
+      "successful": 1,
+      "failed": 0,
+      "run_seconds": {
+        "median": 2.141562041011639,
+        "p95": 2.141562041011639,
+        "max": 2.141562041011639
+      },
+      "records_per_second": {
+        "median": 4669.488816339013,
+        "p95": 4669.488816339013,
+        "max": 4669.488816339013
+      },
+      "peak_rss_bytes": {
+        "median": 27754496,
+        "p95": 27754496.0,
+        "max": 27754496
+      },
+      "resume_seconds": {
+        "median": 2.042429084016476,
+        "p95": 2.042429084016476,
+        "max": 2.042429084016476
+      },
+      "resume_peak_rss_bytes": {
+        "median": 27377664,
+        "p95": 27377664.0,
+        "max": 27377664
+      }
+    }
+  ],
+  "finished_at_utc": "2026-10-22T11:31:51.812969+00:00",
+  "failed_measurements": 0
+}

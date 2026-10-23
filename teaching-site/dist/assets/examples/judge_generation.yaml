@@ -1,0 +1,44 @@
+version: 1
+dataset: {name: judged_demo}
+source:
+  type: jsonl
+  path: topics.jsonl
+providers:
+  generator:
+    type: mock
+    response: |
+      {
+        "question": {{ ("Explain Rust " ~ record.topic ~ ".") | tojson }},
+        "answer": {{ record.summary | tojson }},
+        "difficulty": "easy"
+      }
+  reviewer:
+    # A second model scores the generated record. The mock judge echoes the
+    # generation length as a deterministic score above min_score.
+    type: mock
+    response: '{"score": 0.9}'
+generate:
+  provider: generator
+  prompt: |
+    Create one Rust interview question about {{ record.topic }}.
+    Return JSON only.
+  output_schema:
+    type: object
+    additionalProperties: false
+    required: [question, answer, difficulty]
+    properties:
+      question: {type: string, minLength: 1}
+      answer: {type: string, minLength: 1}
+      difficulty: {enum: [easy, medium, hard]}
+judge:
+  provider: reviewer
+  prompt: |
+    Rate this question and answer for a Rust interview.
+    Question: {{ generated.question }}
+    Answer: {{ generated.answer }}
+    Return JSON with a numeric score field.
+  score_field: score
+  min_score: 0.7
+output:
+  format: jsonl
+  path: output/judged_rust_questions.jsonl

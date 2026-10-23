@@ -1,0 +1,3 @@
+{"topic":"ownership","summary":"Each value has one owner; the value is dropped when its owner goes out of scope."}
+{"topic":"borrowing","summary":"References allow access without transferring ownership, subject to Rust's borrowing rules."}
+{"topic":"traits","summary":"Traits define shared behavior that types can implement."}

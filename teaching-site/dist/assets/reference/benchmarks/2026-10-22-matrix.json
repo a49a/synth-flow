@@ -1,0 +1,323 @@
+{
+  "schema_version": 2,
+  "started_at_utc": "2026-10-22T11:30:01.439663+00:00",
+  "environment": {
+    "system": "Darwin",
+    "os_release": "23.6.0",
+    "os_version": "Darwin Kernel Version 23.6.0: Tue Jul 21 21:57:26 PDT 2026; root:xnu-10063.141.1.713.39~1/RELEASE_ARM64_T6000",
+    "architecture": "arm64",
+    "cpu_model": "Apple M1 Pro",
+    "logical_cpus": 10,
+    "memory_bytes": 34359738368,
+    "python": "3.10.9",
+    "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)\nbinary: rustc\ncommit-hash: 01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf\ncommit-date: 2026-02-11\nhost: aarch64-apple-darwin\nrelease: 1.93.1\nLLVM version: 21.1.8",
+    "cargo": "cargo 1.93.1 (083ac5135 2025-12-15)",
+    "binary": "/Users/ada/src/synth-flow/target/release/synthflow",
+    "binary_bytes": 22808192,
+    "binary_sha256": "cb34f80d72c8a1b04d6ad36ebd95e8a82de32287e685e016c578cb1fa532a60c",
+    "binary_modified_at_utc": "2026-10-22T11:29:58.282673+00:00",
+    "build_profile_hint": "release",
+    "git_revision": "b370a4c7be912b5f5e0a3370fa7e45f5b12e089f",
+    "git_status": "M .github/workflows/ci.yml\n M .gitignore\n M Cargo.lock\n M Cargo.toml\n M IMPLEMENTATION.md\n M README.md\n M SYNTHFLOW_DESIGN.md\n M crates/synthflow-cli/Cargo.toml\n M crates/synthflow-cli/src/main.rs\n M crates/synthflow-cli/tests/faults.rs\n M crates/synthflow/Cargo.toml\n M crates/synthflow/src/dedup.rs\n M crates/synthflow/src/engine.rs\n M crates/synthflow/src/error.rs\n M crates/synthflow/src/inspect.rs\n M crates/synthflow/src/lib.rs\n M crates/synthflow/src/provider.rs\n M crates/synthflow/src/ratelimit.rs\n M crates/synthflow/src/run.rs\n M crates/synthflow/src/source.rs\n M crates/synthflow/src/spec.rs\n M crates/synthflow/tests/dedup.rs\n M crates/synthflow/tests/inspect.rs\n M crates/synthflow/tests/metrics.rs\n M crates/synthflow/tests/minhash.rs\n M crates/synthflow/tests/parquet.rs\n M crates/synthflow/tests/pipeline.rs\n M crates/synthflow/tests/reliability.rs\n M crates/synthflow/tests/remediation.rs\n M crates/synthflow/tests/resume.rs\n M docs/GLOSSARY.md\n M docs/LABS.md\n M docs/README.md\n M docs/TEACHING_GUIDE.md\n M examples/openai_generation.yaml\n?? .github/workflows/release.yml\n?? crates/synthflow-cli/README.md\n?? crates/synthflow/README.md\n?? crates/synthflow/src/blocking.rs\n?? crates/synthflow/src/parquet_schema.rs\n?? crates/synthflow/src/progress.rs\n?? crates/synthflow/src/storage_worker.rs\n?? crates/synthflow/tests/finalization.rs\n?? crates/synthflow/tests/io_workers.rs\n?? crates/synthflow/tests/provider_http.rs\n?? docs/PARQUET_SCHEMA.md\n?? docs/PERFORMANCE.md\n?? docs/RELEASING.md\n?? docs/STATUS.md\n?? docs/benchmarks/\n?? examples/parquet_explicit_schema.yaml\n?? scripts/",
+    "cargo_lock_sha256": "8f8f197dafa5a91dc7480dff70c8e35ca79cbca961235bff9ea6777547d4344f",
+    "benchmark_sha256": "bb466d3805a61af303f00853cb032c10bf756fa541fea14bb8bf358d3e45714f",
+    "temporary_parent": "/var/folders/7_/4f432f9s1vsdhs_s2nyd436m0000gn/T"
+  },
+  "platform": "darwin",
+  "binary": "/Users/ada/src/synth-flow/target/release/synthflow",
+  "settings": {
+    "records": [
+      100000
+    ],
+    "cases": [
+      "exact-memory",
+      "minhash-memory",
+      "minhash-disk",
+      "parquet",
+      "judge"
+    ],
+    "commit_intervals": [
+      1024
+    ],
+    "concurrency": [
+      8
+    ],
+    "repeat": 1,
+    "dedup_max_bytes": 67108864,
+    "text_bytes": 64,
+    "timeout_seconds": 1800.0,
+    "recovery": false,
+    "recovery_timeout_seconds": 60,
+    "recovery_after": null
+  },
+  "measurements": [
+    {
+      "case": "exact-memory",
+      "records": 100000,
+      "commit_every": 1024,
+      "concurrency": 8,
+      "repeat": 1,
+      "status": "completed",
+      "run_seconds": 6.016194667026866,
+      "peak_rss_bytes": 27230208,
+      "returncode": 0,
+      "timed_out": false,
+      "sink_state": {
+        "committed_source_position": 100000,
+        "source_byte_offset": 9588895,
+        "committed_accepted_records": 100000,
+        "committed_rejected_records": 0,
+        "accepted_bytes": 74577790,
+        "rejected_bytes": 0,
+        "accepted_digest": "a7fd8e14fa85ae6ac93cde3e77a204b9c93abbb2b55c20def84bba3e69ea9b7f",
+        "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      },
+      "report_errors": [],
+      "verification": {
+        "method": "streamed_jsonl_rows",
+        "rows": 100000,
+        "order_and_content": true
+      },
+      "records_per_second": 16621.802573655557
+    },
+    {
+      "case": "minhash-memory",
+      "records": 100000,
+      "commit_every": 1024,
+      "concurrency": 8,
+      "repeat": 1,
+      "status": "failed",
+      "run_seconds": 1.6418629999971017,
+      "peak_rss_bytes": 91258880,
+      "returncode": 1,
+      "timed_out": false,
+      "sink_state": {
+        "committed_source_position": 20480,
+        "source_byte_offset": 1954974,
+        "committed_accepted_records": 20480,
+        "committed_rejected_records": 0,
+        "accepted_bytes": 15255868,
+        "rejected_bytes": 0,
+        "accepted_digest": "06932e9f6c516ca63b95ce9a0b8659464528b72ac536cf7887d2c7af071f81e4",
+        "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      },
+      "report_errors": [
+        {
+          "category": "run",
+          "stage": "run",
+          "message": "run failed: dedup memory accounting budget exceeded; increase dedup_max_bytes or set dedup_storage to disk",
+          "attempts": 1,
+          "instance_path": null,
+          "schema_path": null
+        }
+      ],
+      "error": "command failed (exit 1): [{'category': 'run', 'stage': 'run', 'message': 'run failed: dedup memory accounting budget exceeded; increase dedup_max_bytes or set dedup_storage to disk', 'attempts': 1, 'instance_path': None, 'schema_path': None}]"
+    },
+    {
+      "case": "minhash-disk",
+      "records": 100000,
+      "commit_every": 1024,
+      "concurrency": 8,
+      "repeat": 1,
+      "status": "completed",
+      "run_seconds": 25.50014691700926,
+      "peak_rss_bytes": 23052288,
+      "returncode": 0,
+      "timed_out": false,
+      "sink_state": {
+        "committed_source_position": 100000,
+        "source_byte_offset": 9588895,
+        "committed_accepted_records": 100000,
+        "committed_rejected_records": 0,
+        "accepted_bytes": 74577790,
+        "rejected_bytes": 0,
+        "accepted_digest": "b766b426d312e2e634fd1962e2d1262b1d96ba929c1d6169ff1568578b1af676",
+        "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      },
+      "report_errors": [],
+      "verification": {
+        "method": "streamed_jsonl_rows",
+        "rows": 100000,
+        "order_and_content": true
+      },
+      "records_per_second": 3921.546033654316
+    },
+    {
+      "case": "parquet",
+      "records": 100000,
+      "commit_every": 1024,
+      "concurrency": 8,
+      "repeat": 1,
+      "status": "completed",
+      "run_seconds": 7.761199542030226,
+      "peak_rss_bytes": 36454400,
+      "returncode": 0,
+      "timed_out": false,
+      "sink_state": {
+        "committed_source_position": 100000,
+        "source_byte_offset": 9588895,
+        "committed_accepted_records": 100000,
+        "committed_rejected_records": 0,
+        "accepted_bytes": 74577790,
+        "rejected_bytes": 0,
+        "accepted_digest": "9dc99e04321bb776a0e648024aa00906c8d6457bc970f97491baa42a09a5c05d",
+        "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      },
+      "report_errors": [],
+      "verification": {
+        "method": "streamed_parquet_inspect",
+        "rows": 100000,
+        "order_and_content": false,
+        "ordinal": {
+          "name": "ordinal",
+          "data_type": "number",
+          "count": 100000,
+          "null_count": 0,
+          "min": 1,
+          "max": 100000,
+          "mean": 50000.5,
+          "distinct": 100000
+        }
+      },
+      "records_per_second": 12884.606233670076
+    },
+    {
+      "case": "judge",
+      "records": 100000,
+      "commit_every": 1024,
+      "concurrency": 8,
+      "repeat": 1,
+      "status": "completed",
+      "run_seconds": 6.99139791703783,
+      "peak_rss_bytes": 18366464,
+      "returncode": 0,
+      "timed_out": false,
+      "sink_state": {
+        "committed_source_position": 100000,
+        "source_byte_offset": 9588895,
+        "committed_accepted_records": 100000,
+        "committed_rejected_records": 0,
+        "accepted_bytes": 89177790,
+        "rejected_bytes": 0,
+        "accepted_digest": "1b4b2b765b833294f2c9bb517b02b49372337e123e87f3afe091476cdc7f8d26",
+        "rejected_digest": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      },
+      "report_errors": [],
+      "verification": {
+        "method": "streamed_jsonl_rows",
+        "rows": 100000,
+        "order_and_content": true
+      },
+      "records_per_second": 14303.291156737476
+    }
+  ],
+  "summary": [
+    {
+      "case": "exact-memory",
+      "records": 100000,
+      "commit_every": 1024,
+      "concurrency": 8,
+      "samples": 1,
+      "successful": 1,
+      "failed": 0,
+      "run_seconds": {
+        "median": 6.016194667026866,
+        "p95": 6.016194667026866,
+        "max": 6.016194667026866
+      },
+      "records_per_second": {
+        "median": 16621.802573655557,
+        "p95": 16621.802573655557,
+        "max": 16621.802573655557
+      },
+      "peak_rss_bytes": {
+        "median": 27230208,
+        "p95": 27230208.0,
+        "max": 27230208
+      }
+    },
+    {
+      "case": "minhash-memory",
+      "records": 100000,
+      "commit_every": 1024,
+      "concurrency": 8,
+      "samples": 1,
+      "successful": 0,
+      "failed": 1
+    },
+    {
+      "case": "minhash-disk",
+      "records": 100000,
+      "commit_every": 1024,
+      "concurrency": 8,
+      "samples": 1,
+      "successful": 1,
+      "failed": 0,
+      "run_seconds": {
+        "median": 25.50014691700926,
+        "p95": 25.50014691700926,
+        "max": 25.50014691700926
+      },
+      "records_per_second": {
+        "median": 3921.546033654316,
+        "p95": 3921.546033654316,
+        "max": 3921.546033654316
+      },
+      "peak_rss_bytes": {
+        "median": 23052288,
+        "p95": 23052288.0,
+        "max": 23052288
+      }
+    },
+    {
+      "case": "parquet",
+      "records": 100000,
+      "commit_every": 1024,
+      "concurrency": 8,
+      "samples": 1,
+      "successful": 1,
+      "failed": 0,
+      "run_seconds": {
+        "median": 7.761199542030226,
+        "p95": 7.761199542030226,
+        "max": 7.761199542030226
+      },
+      "records_per_second": {
+        "median": 12884.606233670076,
+        "p95": 12884.606233670076,
+        "max": 12884.606233670076
+      },
+      "peak_rss_bytes": {
+        "median": 36454400,
+        "p95": 36454400.0,
+        "max": 36454400
+      }
+    },
+    {
+      "case": "judge",
+      "records": 100000,
+      "commit_every": 1024,
+      "concurrency": 8,
+      "samples": 1,
+      "successful": 1,
+      "failed": 0,
+      "run_seconds": {
+        "median": 6.99139791703783,
+        "p95": 6.99139791703783,
+        "max": 6.99139791703783
+      },
+      "records_per_second": {
+        "median": 14303.291156737476,
+        "p95": 14303.291156737476,
+        "max": 14303.291156737476
+      },
+      "peak_rss_bytes": {
+        "median": 18366464,
+        "p95": 18366464.0,
+        "max": 18366464
+      }
+    }
+  ],
+  "finished_at_utc": "2026-10-22T11:30:53.877649+00:00",
+  "failed_measurements": 1
+}

@@ -1,0 +1,4 @@
+topic,summary
+ownership,Each value has one owner and it is dropped when the owner goes out of scope
+borrowing,"References borrow access, subject to aliasing and mutation rules"
+traits,Traits define shared behavior that types implement

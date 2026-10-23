@@ -15,6 +15,8 @@ This project is a teaching case for Rust streaming, async concurrency, and relia
 请从 [中英文双语教学入口 / Bilingual teaching index](docs/README.md) 开始：包含 11 章源码导读、9 个实验、术语表和教师指南，覆盖当前实现。
 Start with the bilingual teaching index for an eleven-chapter walkthrough, nine labs, a glossary, and instructor notes covering the current implementation.
 
+浏览器课程见 [静态教学网站](teaching-site/README.md)：8 个章节、配置生成器、流水线与恢复演练、自测和本机学习进度。无需前端依赖，从仓库根目录运行 `python3 -m http.server 4173 --bind 127.0.0.1 --directory teaching-site/dist` 即可预览。
+
 ## 快速开始
 
 需要 Rust 1.93 或更新版本。首次构建下载 Cargo 依赖；mock 示例和自动化测试不需要 API key 或外部模型服务。

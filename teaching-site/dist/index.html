@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f6f1">
+  <meta name="description" content="SynthFlow 中文工程学习手册。从 YAML、异步流水线和数据质量，到检查点恢复、Parquet 与百万条实践。包含交互演练和离线实验。">
+  <title>SynthFlow 学习手册 · 从生成到可靠的数据</title>
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="stylesheet" href="assets/style.css">
+  <script defer src="assets/content.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到正文</a>
+  <div class="mobile-shade" data-close-menu></div>
+  <aside class="sidebar" id="sidebar" aria-label="课程导航">
+    <a class="brand" href="#overview" aria-label="SynthFlow 学习首页">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M6 5h20v6H6zM6 21h20v6H6z" fill="currentColor"/><path d="M10 11v5h12v5" fill="none" stroke="currentColor" stroke-width="3"/></svg>
+      <span>SynthFlow<small>THE ENGINEERING GUIDE</small></span>
+    </a>
+    <div class="edition"><span class="live-dot"></span> v0.1.0 <span>中文学习版</span></div>
+    <button class="sidebar-search" data-open-search><span>⌕</span> 搜索课程 <kbd>⌘ K</kbd></button>
+    <nav id="course-nav"></nav>
+    <div class="sidebar-bottom">
+      <div class="progress-heading"><span>你的学习进度</span><strong id="progress-count">0 / 8</strong></div>
+      <div class="progress-track"><span id="progress-bar"></span></div>
+      <p>进度只保存在当前浏览器</p>
+      <a href="assets/reference/TEACHING_GUIDE.md" download>下载完整源码导读 <span>↗</span></a>
+    </div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar">
+      <button class="icon-button mobile-menu" id="menu-toggle" aria-label="打开课程目录" aria-expanded="false" aria-controls="sidebar">☰</button>
+      <div class="breadcrumb"><span>学习手册</span><span>/</span><strong id="breadcrumb">课程概览</strong></div>
+      <div class="top-actions"><span class="local-label"><span class="live-dot"></span> 本地优先 · Rust</span><a href="https://github.com/a49a/synth-flow" target="_blank" rel="noreferrer">GitHub <span>↗</span></a></div>
+    </header>
+    <main id="main" tabindex="-1"><div class="loading">正在打开学习手册…</div></main>
+    <footer class="site-footer"><span>SynthFlow / 合成数据工程学习手册</span><span>基于项目当前实现 · 2026.10 <a href="#resources">资料与能力边界 ↗</a></span></footer>
+  </div>
+  <dialog id="search-dialog" aria-labelledby="search-title">
+    <div class="search-head"><label id="search-title" for="search-input">搜索课程与概念</label><button class="icon-button" data-close-search aria-label="关闭搜索">×</button></div>
+    <input id="search-input" type="search" placeholder="试试「checkpoint」「去重」「YAML」" autocomplete="off">
+    <div id="search-results" aria-live="polite"></div>
+    <p class="search-hint"><kbd>Esc</kbd> 关闭 · 选择结果打开章节</p>
+  </dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <noscript><div class="noscript">请启用 JavaScript 查看课程交互。完整教学内容可下载 <a href="assets/reference/TEACHING_GUIDE.md">源码导读</a> 和 <a href="assets/reference/LABS.md">实验手册</a>。</div></noscript>
+</body>
+</html>

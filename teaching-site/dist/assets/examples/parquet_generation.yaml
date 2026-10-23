@@ -1,0 +1,33 @@
+version: 1
+dataset:
+  name: parquet_demo
+source:
+  type: jsonl
+  path: topics.jsonl
+providers:
+  generator:
+    type: mock
+    response: |
+      {
+        "question": {{ ("Explain Rust " ~ record.topic ~ ".") | tojson }},
+        "answer": {{ record.summary | tojson }},
+        "difficulty": "easy"
+      }
+generate:
+  provider: generator
+  prompt: |
+    Create one Rust interview question about {{ record.topic }}.
+    Return JSON only.
+  output_schema:
+    type: object
+    additionalProperties: false
+    required: [question, answer, difficulty]
+    properties:
+      question: {type: string, minLength: 1}
+      answer: {type: string, minLength: 1}
+      difficulty: {enum: [easy, medium, hard]}
+output:
+  format: parquet
+  # Rows per RecordBatch during the publish conversion.
+  batch_size: 1024
+  path: output/rust_instruction.parquet
