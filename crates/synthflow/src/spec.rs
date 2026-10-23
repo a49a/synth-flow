@@ -302,6 +302,9 @@ pub enum Normalize {
 pub struct Output {
     pub format: OutputFormat,
     pub path: PathBuf,
+    /// Explicit JSON Schema subset for Parquet user fields; `_meta` is automatic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 }
@@ -580,6 +583,12 @@ impl Pipeline {
         }
         if self.output.batch_size == 0 || self.output.batch_size > 65536 {
             return Err(invalid("output.batch_size must be in 1..=65536"));
+        }
+        if let Some(schema) = &self.output.schema {
+            if !matches!(self.output.format, OutputFormat::Parquet) {
+                return Err(invalid("output.schema requires parquet output"));
+            }
+            crate::parquet_schema::OutputSchema::compile(schema)?;
         }
         let mut ancestor = self.output.path.parent();
         while let Some(path) = ancestor {

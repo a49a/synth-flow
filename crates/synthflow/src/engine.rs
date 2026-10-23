@@ -272,6 +272,7 @@ pub async fn resume_with_provider(
     if crate::run::finish_interrupted_publication(&mut prior, &cancellation)? {
         return Ok(prior);
     }
+    crate::run::verify_committed_prefixes(&prior, &cancellation)?;
     let mut dedup = pipeline
         .dedup
         .as_ref()
@@ -383,6 +384,9 @@ async fn visit_committed_rows(
     mut visit: impl FnMut(&Value) -> Result<()>,
 ) -> Result<()> {
     use std::io::{BufRead, Read};
+    if prior.sink_state.committed_accepted_records == 0 {
+        return Ok(());
+    }
     let file =
         std::fs::File::open(&prior.partial_path).map_err(|e| Error::io(&prior.partial_path, e))?;
     if file
@@ -486,7 +490,8 @@ async fn execute(
                 ));
             }
             source.resume_from(skip_through, prior.sink_state.source_byte_offset)?;
-            let (artifacts, report) = Artifacts::resume(pipeline, source_hash, &prior)?;
+            let (artifacts, report) =
+                Artifacts::resume(pipeline, source_hash, &prior, &cancellation)?;
             tracing::info!(
                 run_id = report.run_id,
                 resumed_from = prior.run_id,
@@ -664,7 +669,7 @@ async fn execute(
     report.statistics.latency = latencies.summary();
     report.statistics.latency_calls_total = latencies.count;
     report.finished_at_unix_ms = Some(now_ms());
-    let result = result.and_then(|()| artifacts.publish(&mut report));
+    let result = result.and_then(|()| artifacts.publish(&mut report, &cancellation));
     if let Err(error) = result {
         report.status = if matches!(error, Error::Cancelled) {
             RunStatus::Cancelled
