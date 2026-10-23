@@ -1,5 +1,12 @@
 use clap::{Parser, Subcommand};
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    path::PathBuf,
+    process::ExitCode,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 use synthflow::Pipeline;
 use tokio_util::sync::CancellationToken;
 
@@ -118,15 +125,8 @@ async fn execute(cli: Cli) -> synthflow::Result<ExitCode> {
         Command::Run { strict, .. } | Command::Resume { strict, .. } => {
             pipeline.errors.strict |= strict;
             let cancellation = CancellationToken::new();
-            let signal_token = cancellation.clone();
-            let signals = tokio::spawn(async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    signal_token.cancel();
-                    if tokio::signal::ctrl_c().await.is_ok() {
-                        std::process::exit(130);
-                    }
-                }
-            });
+            let signal_exit = Arc::new(AtomicU8::new(130));
+            let signals = install_signal_handler(cancellation.clone(), signal_exit.clone())?;
             let result = match cli.command {
                 Command::Resume { .. } => synthflow::resume_async(&pipeline, cancellation).await,
                 _ => synthflow::run_async(&pipeline, cancellation).await,
@@ -141,7 +141,7 @@ async fn execute(cli: Cli) -> synthflow::Result<ExitCode> {
             return Ok(if report.succeeded() {
                 ExitCode::SUCCESS
             } else if report.status == synthflow::RunStatus::Cancelled {
-                ExitCode::from(130)
+                ExitCode::from(signal_exit.load(Ordering::SeqCst))
             } else {
                 ExitCode::FAILURE
             });
@@ -149,4 +149,47 @@ async fn execute(cli: Cli) -> synthflow::Result<ExitCode> {
         Command::Inspect { .. } => unreachable!("handled above"),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn install_signal_handler(
+    cancellation: CancellationToken,
+    exit_code: Arc<AtomicU8>,
+) -> synthflow::Result<tokio::task::JoinHandle<()>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| {
+            synthflow::Error::Configuration("cannot register SIGINT handler".into())
+        })?;
+        let mut terminate = signal(SignalKind::terminate()).map_err(|_| {
+            synthflow::Error::Configuration("cannot register SIGTERM handler".into())
+        })?;
+        Ok(tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                let code = tokio::select! {
+                    value = interrupt.recv() => { if value.is_none() { break; } 130 },
+                    value = terminate.recv() => { if value.is_none() { break; } 143 },
+                };
+                if !first {
+                    std::process::exit(code.into());
+                }
+                exit_code.store(code, Ordering::SeqCst);
+                cancellation.cancel();
+                first = false;
+            }
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                exit_code.store(130, Ordering::SeqCst);
+                cancellation.cancel();
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    std::process::exit(130);
+                }
+            }
+        }))
+    }
 }

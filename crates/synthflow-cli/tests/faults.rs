@@ -30,9 +30,10 @@ async fn handler(
     }
     Json(json!({"choices":[{"message":{"content":"{\"answer\":\"ok\"}"}}]}))
 }
-async fn start(
+async fn start_logging(
     dir: &std::path::Path,
     block: bool,
+    log: &str,
 ) -> (
     std::process::Child,
     Arc<StateData>,
@@ -64,12 +65,22 @@ async fn start(
         .arg("run")
         .arg(config)
         .env("SYNTHFLOW_TEST_KEY", "fixture-secret-key")
-        .env("RUST_LOG", "error")
+        .env("RUST_LOG", log)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn");
     (child, state, server)
+}
+async fn start(
+    dir: &std::path::Path,
+    block: bool,
+) -> (
+    std::process::Child,
+    Arc<StateData>,
+    tokio::task::JoinHandle<()>,
+) {
+    start_logging(dir, block, "error").await
 }
 async fn wait(mut child: std::process::Child) -> std::process::Output {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -237,4 +248,33 @@ fn strict_cli_failure_still_prints_statistics_and_preflight_is_json() {
     assert!(!result.status.success());
     let report: Value = serde_json::from_slice(&result.stdout).expect("preflight");
     assert_eq!(report["preflight"], true);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_preserves_checkpoint_and_progress_continues_during_a_slow_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, state, server) = start_logging(dir.path(), true, "info").await;
+    wait_for_second_request(&mut child, &state).await;
+    // No record completes during this interval. A result-driven logger would
+    // remain silent; the independent heartbeat must still report progress.
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = wait(child).await;
+    server.abort();
+    assert_eq!(output.status.code(), Some(143));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "cancelled");
+    assert_eq!(report["sink_state"]["committed_source_position"], 1);
+    let logs = String::from_utf8_lossy(&output.stderr);
+    assert!(logs.contains("progress"), "{logs}");
+    assert!(logs.contains("in_flight=1"), "{logs}");
+    assert!(logs.contains("committed=1"), "{logs}");
+    assert!(!dir.path().join("result.jsonl").exists());
 }

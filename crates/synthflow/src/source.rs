@@ -10,14 +10,14 @@ use std::{
     path::PathBuf,
 };
 
-pub struct Source<'a> {
-    input: Input<'a>,
+pub struct Source {
+    input: Input,
     position: u64,
     finished: bool,
 }
 
-enum Input<'a> {
-    Inline(std::slice::Iter<'a, Value>),
+enum Input {
+    Inline(std::vec::IntoIter<Value>),
     Jsonl {
         reader: BufReader<File>,
         path: PathBuf,
@@ -28,7 +28,7 @@ enum Input<'a> {
     },
 }
 
-impl<'a> Source<'a> {
+impl Source {
     pub(crate) fn byte_offset(&mut self) -> Result<Option<u64>> {
         match &mut self.input {
             Input::Inline(_) => Ok(None),
@@ -82,9 +82,9 @@ impl<'a> Source<'a> {
         self.position = position;
         Ok(())
     }
-    pub fn open(config: &'a SourceConfig) -> Result<Self> {
+    pub fn open(config: &SourceConfig) -> Result<Self> {
         let input = match config {
-            SourceConfig::Inline { records } => Input::Inline(records.iter()),
+            SourceConfig::Inline { records } => Input::Inline(records.clone().into_iter()),
             SourceConfig::Jsonl { path } => Input::Jsonl {
                 reader: BufReader::new(File::open(path).map_err(|e| Error::io(path, e))?),
                 path: path.clone(),
@@ -117,7 +117,7 @@ impl<'a> Source<'a> {
     }
 }
 
-impl Iterator for Source<'_> {
+impl Iterator for Source {
     type Item = Result<(u64, Value)>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -125,7 +125,7 @@ impl Iterator for Source<'_> {
             return None;
         }
         let result = match &mut self.input {
-            Input::Inline(iter) => iter.next().cloned().map(Ok),
+            Input::Inline(iter) => iter.next().map(Ok),
             Input::Jsonl { reader, path } => {
                 let mut line = Vec::new();
                 match reader

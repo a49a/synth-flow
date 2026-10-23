@@ -686,3 +686,56 @@ async fn judge_reuses_the_same_configured_provider_instance() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     assert_eq!(report.statistics.latency_calls_total, 2);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelling_parquet_publication_keeps_a_resumable_checkpoint() {
+    let dir = TempDir::new().unwrap();
+    let mut spec = fixture(
+        &dir,
+        json!(
+            (0..1000)
+                .map(|i| json!({"topic":i.to_string()}))
+                .collect::<Vec<_>>()
+        ),
+        "parquet",
+    );
+    spec.output.commit_every = 1000;
+    spec.providers.insert(
+        "generator".into(),
+        serde_json::from_value(
+            json!({"type":"mock","response":json!({"answer":"x".repeat(4096)}).to_string()}),
+        )
+        .unwrap(),
+    );
+    let token = CancellationToken::new();
+    let run = synthflow::run_async(&spec, token.clone());
+    tokio::pin!(run);
+    let report = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                result = &mut run => panic!("publication completed before cancellation: {:?}", result.unwrap().status),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                    if fs::read_dir(dir.path()).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".synthflow-publish-")) {
+                        token.cancel();
+                        break run.await.unwrap();
+                    }
+                }
+            }
+        }
+    }).await.unwrap();
+    assert_eq!(report.status, RunStatus::Cancelled, "{:?}", report.errors);
+    assert!(!spec.output.path.exists());
+    assert!(report.partial_path.exists());
+    assert_eq!(report.sink_state.committed_source_position, 1000);
+    assert!(!fs::read_dir(dir.path()).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".synthflow-publish-")
+    }));
+    let resumed = synthflow::resume_async(&spec, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(resumed.succeeded(), "{:?}", resumed.errors);
+    assert_eq!(parquet_rows(&spec.output.path), 1000);
+}

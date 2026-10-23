@@ -150,6 +150,13 @@ fn default_dedup_budget() -> usize {
 fn is_default_dedup_budget(value: &usize) -> bool {
     *value == default_dedup_budget()
 }
+fn default_commit_every() -> u64 {
+    1
+}
+fn is_default_commit_every(value: &u64) -> bool {
+    *value == 1
+}
+
 fn default_timeout() -> u64 {
     60_000
 }
@@ -307,6 +314,11 @@ pub struct Output {
     pub schema: Option<Value>,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    #[serde(
+        default = "default_commit_every",
+        skip_serializing_if = "is_default_commit_every"
+    )]
+    pub commit_every: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -600,8 +612,10 @@ impl Pipeline {
             }
             ancestor = path.parent();
         }
-        if self.dedup_max_bytes == 0 {
-            return Err(invalid("dedup_max_bytes must be positive"));
+        if self.dedup_max_bytes == 0 || !(1..=65536).contains(&self.output.commit_every) {
+            return Err(invalid(
+                "dedup_max_bytes must be positive; output.commit_every must be in 1..=65536",
+            ));
         }
         for (name, pricing) in &self.provider_pricing {
             if !self.providers.contains_key(name) {

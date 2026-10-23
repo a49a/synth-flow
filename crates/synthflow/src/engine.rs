@@ -1,12 +1,13 @@
 use crate::{
     Error, Pipeline, Result,
-    dedup::{DedupAdmission, DedupState},
+    blocking::BlockingWorker,
+    dedup::DedupState,
+    progress::ProgressReporter,
     provider::{GenerateRequest, LlmProvider, ProviderStatistics, create_provider},
     record::{RecordMeta, record_id},
-    run::{
-        Artifacts, RunLock, RunReport, RunStatus, WriteResult, fingerprint, now_ms, save_report,
-    },
+    run::{Artifacts, RunLock, RunReport, RunStatus, WriteResult, fingerprint, now_ms},
     source::Source,
+    storage_worker::StorageWorker,
     template,
 };
 use futures_util::{StreamExt, stream::FuturesOrdered};
@@ -217,7 +218,12 @@ pub async fn run_with_provider(
     cancellation: CancellationToken,
 ) -> Result<RunReport> {
     pipeline.validate()?;
-    let lock = RunLock::acquire(&crate::spec::normalize_path(&pipeline.output.path)?)?;
+    let output = pipeline.output.path.clone();
+    let lock = tokio::task::spawn_blocking(move || {
+        RunLock::acquire(&crate::spec::normalize_path(&output)?)
+    })
+    .await
+    .map_err(|_| Error::RunFailed("run lock worker failed".into()))??;
     execute(pipeline, provider, cancellation, None, lock).await
 }
 
@@ -249,8 +255,19 @@ pub async fn resume_with_provider(
     }
     // The lock is taken before any checkpoint read so a loser re-reads the
     // winner's terminal state instead of truncating shared artifacts.
-    let lock = RunLock::acquire(&crate::spec::normalize_path(&pipeline.output.path)?)?;
-    let mut prior = prior_manifest(pipeline)?;
+    let output = pipeline.output.path.clone();
+    let lock = tokio::task::spawn_blocking(move || {
+        RunLock::acquire(&crate::spec::normalize_path(&output)?)
+    })
+    .await
+    .map_err(|_| Error::RunFailed("run lock worker failed".into()))??;
+    let spec = pipeline.clone();
+    let (lock, prior) = tokio::task::spawn_blocking(move || {
+        let prior = prior_manifest(&spec)?;
+        Ok::<_, Error>((lock, prior))
+    })
+    .await
+    .map_err(|_| Error::RunFailed("checkpoint worker failed".into()))??;
     // A prefix that already violates the active policies cannot be resumed
     // into a published dataset; fail before touching any artifact.
     if let Some(violation) = policies_violated(
@@ -269,24 +286,38 @@ pub async fn resume_with_provider(
             "source changed since the recorded run; refusing to resume".into(),
         ));
     }
-    if crate::run::finish_interrupted_publication(&mut prior, &cancellation)? {
+    let token = cancellation.clone();
+    let (prior, finished, lock) = tokio::task::spawn_blocking(move || {
+        let mut prior = prior;
+        let result = crate::run::finish_interrupted_publication(&mut prior, &token);
+        (prior, result, lock)
+    })
+    .await
+    .map_err(|_| Error::RunFailed("publication recovery worker failed".into()))?;
+    if finished? {
         return Ok(prior);
     }
-    crate::run::verify_committed_prefixes(&prior, &cancellation)?;
-    let mut dedup = pipeline
-        .dedup
-        .as_ref()
-        .map(|config| {
-            DedupState::with_storage(config, pipeline.dedup_max_bytes, pipeline.dedup_storage)
-        })
-        .transpose()?;
-    visit_committed_rows(&prior, &cancellation, |row| {
-        if let Some(state) = &mut dedup {
-            state.restore(row)?;
-        }
-        Ok(())
+    let spec = pipeline.clone();
+    let token = cancellation.clone();
+    let (prior, dedup, lock) = tokio::task::spawn_blocking(move || {
+        crate::run::verify_committed_prefixes(&prior, &token)?;
+        let mut dedup = spec
+            .dedup
+            .as_ref()
+            .map(|config| {
+                DedupState::with_storage(config, spec.dedup_max_bytes, spec.dedup_storage)
+            })
+            .transpose()?;
+        visit_committed_rows(&prior, &token, |row| {
+            if let Some(state) = &mut dedup {
+                state.restore(row)?;
+            }
+            Ok(())
+        })?;
+        Ok::<_, Error>((prior, dedup, lock))
     })
-    .await?;
+    .await
+    .map_err(|_| Error::RunFailed("checkpoint rebuild worker failed".into()))??;
     let context = ResumeContext {
         skip_through: prior.sink_state.committed_source_position,
         dedup,
@@ -378,7 +409,7 @@ fn policies_violated(
 
 /// Validate and rebuild state one accepted row at a time. Memory holds only
 /// one decoded record in addition to the dedup index itself.
-async fn visit_committed_rows(
+fn visit_committed_rows(
     prior: &crate::run::RunReport,
     cancellation: &CancellationToken,
     mut visit: impl FnMut(&Value) -> Result<()>,
@@ -424,9 +455,6 @@ async fn visit_committed_rows(
             .map_err(|_| Error::Configuration("committed prefix contains an invalid row".into()))?;
         visit(&row)?;
         count += 1;
-        if count % 500 == 0 {
-            tokio::task::yield_now().await;
-        }
     }
     if count != prior.sink_state.committed_accepted_records {
         return Err(Error::Configuration(
@@ -443,7 +471,7 @@ async fn execute(
     resume: Option<ResumeContext>,
     // Held until this function returns: run/resume, publication, and every
     // manifest write happen under the same exclusive namespace lock.
-    _run_lock: RunLock,
+    run_lock: RunLock,
 ) -> Result<RunReport> {
     pipeline.validate()?;
     if !(1..=1024).contains(&provider.concurrency()) {
@@ -457,50 +485,55 @@ async fn execute(
         .map_err(|_| Error::Configuration("invalid generation template".into()))?;
     let judge = build_judge(pipeline, provider.clone())?;
     let source_hash = source_fingerprint(pipeline, &cancellation).await?;
-    let mut source = Source::open(&pipeline.source)?;
-    let (mut artifacts, mut report, skip_through, mut dedup) = match resume {
-        None => {
-            let (artifacts, report) = Artifacts::create(pipeline, source_hash)?;
-            (
-                artifacts,
-                report,
-                0,
-                pipeline
-                    .dedup
-                    .as_ref()
-                    .map(|config| {
-                        DedupState::with_storage(
-                            config,
-                            pipeline.dedup_max_bytes,
-                            pipeline.dedup_storage,
-                        )
-                    })
-                    .transpose()?,
-            )
-        }
-        Some(context) => {
-            let ResumeContext {
-                skip_through,
-                dedup,
-                prior,
-            } = context;
-            if source_hash != prior.source_fingerprint {
-                return Err(Error::Configuration(
-                    "source changed while preparing resume".into(),
-                ));
-            }
-            source.resume_from(skip_through, prior.sink_state.source_byte_offset)?;
-            let (artifacts, report) =
-                Artifacts::resume(pipeline, source_hash, &prior, &cancellation)?;
-            tracing::info!(
-                run_id = report.run_id,
-                resumed_from = prior.run_id,
-                skip_through,
-                event = "run_resumed"
-            );
-            (artifacts, report, skip_through, dedup)
-        }
-    };
+    let spec = pipeline.clone();
+    let resume_token = cancellation.clone();
+    let (source, artifacts, mut report, skip_through, dedup, run_lock) =
+        tokio::task::spawn_blocking(move || {
+            let mut source = Source::open(&spec.source)?;
+            let (artifacts, report, skip_through, dedup) = match resume {
+                None => {
+                    let dedup = spec
+                        .dedup
+                        .as_ref()
+                        .map(|config| {
+                            DedupState::with_storage(
+                                config,
+                                spec.dedup_max_bytes,
+                                spec.dedup_storage,
+                            )
+                        })
+                        .transpose()?;
+                    let (artifacts, report) = Artifacts::create(&spec, source_hash)?;
+                    (artifacts, report, 0, dedup)
+                }
+                Some(ResumeContext {
+                    skip_through,
+                    dedup,
+                    prior,
+                }) => {
+                    if source_hash != prior.source_fingerprint {
+                        return Err(Error::Configuration(
+                            "source changed while preparing resume".into(),
+                        ));
+                    }
+                    source.resume_from(skip_through, prior.sink_state.source_byte_offset)?;
+                    let (artifacts, report) =
+                        Artifacts::resume(&spec, source_hash, &prior, &resume_token)?;
+                    tracing::info!(
+                        run_id = report.run_id,
+                        resumed_from = prior.run_id,
+                        skip_through,
+                        event = "run_resumed"
+                    );
+                    (artifacts, report, skip_through, dedup)
+                }
+            };
+            Ok::<_, Error>((source, artifacts, report, skip_through, dedup, run_lock))
+        })
+        .await
+        .map_err(|_| Error::RunFailed("run initialization worker failed".into()))??;
+    let source = BlockingWorker::new(source)?;
+    let artifacts = StorageWorker::new(artifacts, dedup, run_lock)?;
     let started = Instant::now();
     tracing::info!(run_id = report.run_id, event = "run_started");
     let tools = StageTools {
@@ -515,21 +548,29 @@ async fn execute(
     let mut source_done = false;
     let mut source_error = None;
     let mut latencies = LatencyTracker::default();
-    let mut progress_at = started;
-    let mut progress_count = 0u64;
+    let mut progress = ProgressReporter::new(&report, started);
+    let mut last_completed = None;
     let result = async {
         loop {
             if cancellation.is_cancelled() { return Err(Error::Cancelled); }
             while !source_done && pending.len() < provider.concurrency() {
-                match source.next() {
-                    Some(Ok((position, data))) => {
+                if cancellation.is_cancelled() { return Err(Error::Cancelled); }
+                progress.update(&report, pending.len(), "reading_source");
+                let item = source.call(|source| {
+                    Ok(source.next().map(|item| {
+                        let (position, data) = item?;
+                        Ok((position, data, source.byte_offset()?))
+                    }))
+                }).await?;
+                match item {
+                    Some(Ok((position, data, offset))) => {
                         if position <= skip_through {
                             if cancellation.is_cancelled() { return Err(Error::Cancelled); }
                             if position % 500 == 0 { tokio::task::yield_now().await; }
                             continue; // Legacy file checkpoints without byte offsets.
                         }
                         report.statistics.source_records_total += 1;
-                        pending.push_back(process(position, data, source.byte_offset()?, &tools, &cancellation));
+                        pending.push_back(process(position, data, offset, &tools, &cancellation));
                     }
                     Some(Err(error)) => {
                         report.statistics.source_records_total += 1;
@@ -540,6 +581,7 @@ async fn execute(
                     None => source_done = true,
                 }
             }
+            progress.update(&report, pending.len(), "generating");
             let outcome = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(Error::Cancelled),
@@ -560,78 +602,42 @@ async fn execute(
                         input.insert("judge".into(), json!({"provider": judge.provider, "model": judge.model, "score": judge.score}));
                     }
                     input.insert("generated".into(), generated.value);
-                    // Dedup keys cover input plus generated; metadata is
-                    // per-run. Admission registers only after the sink
-                    // accepts the record, so sink-rejected rows never
-                    // pollute the state; missing key fields reject the
-                    // record itself instead of failing the run.
-                    let admission = match &dedup {
-                        None => DedupOutcome::Proceed(None),
-                        Some(state) => match state.check(&Value::Object(input.clone())) {
-                            Ok(DedupAdmission::Duplicate) => {
-                                DedupOutcome::Reject(Error::Duplicate)
-                            }
-                            Ok(DedupAdmission::Unique(key)) => DedupOutcome::Proceed(Some(key)),
-                            Err(error @ Error::DedupField { .. }) => DedupOutcome::Reject(error),
-                            Err(error) => return Err(error),
-                        },
+                    let meta = RecordMeta {
+                        record_id: id.clone(), run_id: report.run_id.clone(), source_position: outcome.position,
+                        pipeline_hash: report.pipeline_hash.clone(), pipeline_version: pipeline.version,
+                        source_fingerprint: report.source_fingerprint.clone(),
+                        stage: "accepted", attempt: generated.attempts, generator_provider: pipeline.generate.provider.clone(), generator_model: generated.model,
+                        prompt_hash: generated.prompt_hash, template_engine: "minijinja/2",
+                        judge_provider: generated.judge.as_ref().map(|j| j.provider.clone()),
+                        judge_model: generated.judge.as_ref().map(|j| j.model.clone()),
+                        judge_score: generated.judge.as_ref().map(|j| j.score),
                     };
-                    match admission {
-                        DedupOutcome::Reject(error) => {
-                            if matches!(error, Error::Duplicate) {
-                                report.statistics.duplicate_records_total += 1;
-                            }
-                            write_rejection(&mut artifacts, &mut report, &id, outcome.position, &error, outcome.attempts)?;
-                            true
+                    let meta = serde_json::to_value(meta).map_err(|_| Error::Sink("metadata serialization failed".into()))?;
+                    progress.update(&report, pending.len(), "writing");
+                    match artifacts.accept(Value::Object(input), meta).await? {
+                        WriteResult::Written => {
+                            report.statistics.accepted_records_total += 1;
+                            false
                         }
-                        DedupOutcome::Proceed(key) => {
-                            let meta = RecordMeta {
-                                record_id: id.clone(), run_id: report.run_id.clone(), source_position: outcome.position,
-                                pipeline_hash: report.pipeline_hash.clone(), pipeline_version: pipeline.version,
-                                source_fingerprint: report.source_fingerprint.clone(),
-                                stage: "accepted", attempt: generated.attempts, generator_provider: pipeline.generate.provider.clone(), generator_model: generated.model,
-                                prompt_hash: generated.prompt_hash, template_engine: "minijinja/2",
-                                judge_provider: generated.judge.as_ref().map(|j| j.provider.clone()),
-                                judge_model: generated.judge.as_ref().map(|j| j.model.clone()),
-                                judge_score: generated.judge.as_ref().map(|j| j.score),
-                            };
-                            input.insert("_meta".into(), serde_json::to_value(meta).map_err(|_| Error::Sink("metadata serialization failed".into()))?);
-                            match artifacts.write_accepted(outcome.position, &Value::Object(input))? {
-                                WriteResult::Written => {
-                                    if let (Some(state), Some(key)) = (&mut dedup, key) {
-                                        state.register(key)?;
-                                    }
-                                    report.statistics.accepted_records_total += 1;
-                                    false
-                                }
-                                WriteResult::Rejected(error) => {
-                                    write_rejection(&mut artifacts, &mut report, &id, outcome.position, &error, outcome.attempts)?;
-                                    true
-                                }
-                            }
+                        WriteResult::Rejected(error) => {
+                            if matches!(error, Error::Duplicate) { report.statistics.duplicate_records_total += 1; }
+                            write_rejection(&artifacts, &mut report, &id, outcome.position, &error, outcome.attempts).await?;
+                            true
                         }
                     }
                 }
                 Err(error) => {
-                    write_rejection(&mut artifacts, &mut report, &id, outcome.position, &error, outcome.attempts)?;
+                    write_rejection(&artifacts, &mut report, &id, outcome.position, &error, outcome.attempts).await?;
                     true
                 }
             };
             refresh(&mut report, started, provider.as_ref(), judge.as_ref(), pipeline);
-            artifacts.commit(&mut report, outcome.position, outcome.source_byte_offset)?;
-            if report.statistics.processed_records_total - progress_count >= 500
-                || progress_at.elapsed() >= std::time::Duration::from_secs(2)
-            {
-                tracing::info!(
-                    processed = report.statistics.processed_records_total,
-                    accepted = report.statistics.accepted_records_total,
-                    rejected = report.statistics.rejected_records_total,
-                    rate = report.statistics.records_per_second,
-                    event = "progress"
-                );
-                progress_count = report.statistics.processed_records_total;
-                progress_at = Instant::now();
+            last_completed = Some((outcome.position, outcome.source_byte_offset));
+            if report.statistics.processed_records_total % pipeline.output.commit_every == 0 {
+                progress.update(&report, pending.len(), "committing");
+                artifacts.commit(&mut report, outcome.position, outcome.source_byte_offset).await?;
             }
+            progress.update(&report, pending.len(), "processing");
             if rejected && pipeline.errors.strict { return Err(Error::FailurePolicy("strict mode rejects any failed record".into())); }
             if pipeline.errors.max_failed_records.is_some_and(|max| report.base_rejected_records + report.statistics.rejected_records_total > max) {
                 return Err(Error::FailurePolicy("max_failed_records exceeded".into()));
@@ -641,6 +647,10 @@ async fn execute(
             tokio::task::yield_now().await;
         }
         if let Some(error) = source_error.take() { return Err(error); }
+        if let Some((position, offset)) = last_completed
+            && position > report.sink_state.committed_source_position {
+            artifacts.commit(&mut report, position, offset).await?;
+        }
         // Re-validate every policy over dataset-wide counts before publishing;
         // a resume with no new input must not publish an already-violating run.
         if let Some(violation) = policies_violated(
@@ -651,6 +661,7 @@ async fn execute(
         ) {
             return Err(Error::FailurePolicy(violation.into()));
         }
+        progress.update(&report, 0, "verifying_source");
         if source_fingerprint(pipeline, &cancellation).await? != report.source_fingerprint {
             return Err(Error::Source { position: report.sink_state.committed_source_position, message: "source changed during execution; output was not published".into() });
         }
@@ -669,18 +680,32 @@ async fn execute(
     report.statistics.latency = latencies.summary();
     report.statistics.latency_calls_total = latencies.count;
     report.finished_at_unix_ms = Some(now_ms());
-    let result = result.and_then(|()| artifacts.publish(&mut report, &cancellation));
+    let result = match result {
+        Ok(()) => {
+            progress.update(&report, 0, "publishing");
+            artifacts.publish(&mut report, cancellation.clone()).await
+        }
+        Err(error) => Err(error),
+    };
     if let Err(error) = result {
+        refresh(
+            &mut report,
+            started,
+            provider.as_ref(),
+            judge.as_ref(),
+            pipeline,
+        );
+        report.finished_at_unix_ms = Some(now_ms());
         report.status = if matches!(error, Error::Cancelled) {
             RunStatus::Cancelled
         } else {
             RunStatus::Failed
         };
         report.errors.push(error.diagnostic());
-        if let Err(error) = artifacts.rollback_uncommitted(&report) {
+        if let Err(error) = artifacts.rollback(&report).await {
             report.errors.push(error.diagnostic());
         }
-        if let Err(error) = save_report(&report) {
+        if let Err(error) = artifacts.save(&report).await {
             report.errors.push(error.diagnostic());
         }
         tracing::error!(run_id = report.run_id, status = ?report.status, event = "run_failed");
@@ -691,11 +716,23 @@ async fn execute(
             event = "run_completed"
         );
     }
+    drop(progress);
+    if let Err(error) = source.close().await {
+        report.status = RunStatus::Failed;
+        report.errors.push(error.diagnostic());
+        if let Err(error) = artifacts.save(&report).await {
+            report.errors.push(error.diagnostic());
+        }
+    }
+    if let Err(error) = artifacts.close().await {
+        report.status = RunStatus::Failed;
+        report.errors.push(error.diagnostic());
+    }
     Ok(report)
 }
 
-fn write_rejection(
-    artifacts: &mut Artifacts,
+async fn write_rejection(
+    artifacts: &StorageWorker,
     report: &mut RunReport,
     id: &str,
     position: u64,
@@ -704,12 +741,14 @@ fn write_rejection(
 ) -> Result<()> {
     let mut diagnostic = error.diagnostic();
     diagnostic.attempts = diagnostic.attempts.max(attempts);
-    artifacts.write_rejected(&json!({
-        "run_id": report.run_id,
-        "record_id": id,
-        "source_position": position,
-        "diagnostic": diagnostic,
-    }))?;
+    artifacts
+        .write_rejected(json!({
+            "run_id": report.run_id,
+            "record_id": id,
+            "source_position": position,
+            "diagnostic": diagnostic,
+        }))
+        .await?;
     report.statistics.rejected_records_total += 1;
     tracing::warn!(
         position,
@@ -789,13 +828,6 @@ async fn source_fingerprint(
     tokio::task::spawn_blocking(move || fingerprint(&source, &cancellation))
         .await
         .map_err(|_| Error::RunFailed("source fingerprint worker failed".into()))?
-}
-
-/// Dedup decision for one record: reject it, or proceed carrying the key to
-/// register once the sink accepts.
-enum DedupOutcome {
-    Reject(Error),
-    Proceed(Option<crate::dedup::PreparedKey>),
 }
 
 struct Generated {

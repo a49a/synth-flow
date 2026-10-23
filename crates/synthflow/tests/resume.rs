@@ -319,3 +319,56 @@ async fn resume_refuses_changed_pipelines_and_missing_states() {
         assert!(error.to_string().contains("pipeline changed"));
     }
 }
+
+#[tokio::test]
+async fn batched_checkpoint_discards_tail_and_resumes_without_duplicates() {
+    let dir = TempDir::new().unwrap();
+    let mut spec = fixture(
+        &dir,
+        json!([{"topic":"a"},{"topic":"b"},{"topic":"c"},{"topic":"d"},{"topic":"e"}]),
+    );
+    spec.output.commit_every = 3;
+    let halted = Arc::new(Mutex::new(false));
+    let provider = Arc::new(HaltingProvider {
+        allow: 4,
+        calls: AtomicUsize::new(0),
+        halted: halted.clone(),
+    });
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    let watcher = async move {
+        while !*halted.lock().unwrap() {
+            tokio::task::yield_now().await;
+        }
+        cancel.cancel();
+    };
+    let (report, ()) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::join!(run_with_provider(&spec, provider, token), watcher)
+    })
+    .await
+    .unwrap();
+    let report = report.unwrap();
+    assert_eq!(report.status, RunStatus::Cancelled);
+    assert_eq!(report.sink_state.committed_source_position, 3);
+    assert_eq!(
+        fs::metadata(&report.partial_path).unwrap().len(),
+        report.sink_state.accepted_bytes
+    );
+    let resumed = resume_with_provider(
+        &spec,
+        Arc::new(Scripted::from_answers(&["d", "e"])),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(resumed.succeeded(), "{:?}", resumed.errors);
+    assert_eq!(resumed.sink_state.committed_source_position, 5);
+    assert_eq!(rows(&spec).len(), 5);
+    assert_eq!(
+        rows(&spec)
+            .iter()
+            .map(|r| r["_meta"]["source_position"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5]
+    );
+}

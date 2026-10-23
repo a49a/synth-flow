@@ -258,3 +258,34 @@ async fn missing_provider_price_does_not_report_a_partial_total() {
     assert!(report.statistics.estimated_cost_usd.is_none());
     assert_eq!(report.statistics.estimated_cost_by_provider.len(), 1);
 }
+
+#[test]
+fn new_resource_and_price_configuration_is_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = fixture(&dir, json!([]), None);
+    let serialized = serde_json::to_value(&spec).unwrap();
+    assert!(serialized.get("provider_pricing").is_none());
+    assert!(serialized.get("dedup_max_bytes").is_none());
+    assert!(serialized["output"].get("commit_every").is_none());
+    for interval in [0, 65537] {
+        spec.output.commit_every = interval;
+        assert!(spec.validate().is_err());
+    }
+    spec.output.commit_every = 1;
+    spec.dedup_max_bytes = 0;
+    assert!(spec.validate().is_err());
+    spec.dedup_max_bytes = 128;
+    spec.provider_pricing.insert(
+        "unknown".into(),
+        serde_json::from_value(json!({"input_usd_per_mtok":1,"output_usd_per_mtok":1})).unwrap(),
+    );
+    assert!(spec.validate().is_err());
+    let price = spec.provider_pricing.remove("unknown").unwrap();
+    spec.provider_pricing.insert("generator".into(), price);
+    assert!(spec.validate().is_ok());
+    spec.provider_pricing
+        .get_mut("generator")
+        .unwrap()
+        .input_usd_per_mtok = f64::INFINITY;
+    assert!(spec.validate().is_err());
+}
