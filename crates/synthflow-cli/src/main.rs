@@ -87,7 +87,7 @@ async fn execute(cli: Cli) -> synthflow::Result<ExitCode> {
                 "column", "type", "non-null", "null"
             );
             for column in &summary.columns {
-                let numeric = match (column.min, column.max, column.mean) {
+                let numeric = match (&column.min, &column.max, column.mean) {
                     (Some(min), Some(max), Some(mean)) => {
                         format!("min={min} max={max} mean={mean:.3}")
                     }

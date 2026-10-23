@@ -35,8 +35,8 @@ async fn jsonl_summaries_cover_types_nulls_and_numeric_ranges() {
     assert_eq!(topic.distinct, Some(2));
     let weight = column(&summary, "weight");
     assert_eq!(weight.data_type, "number");
-    assert_eq!(weight.min, Some(0.2));
-    assert_eq!(weight.max, Some(0.9));
+    assert_eq!(weight.min, Some(serde_json::Number::from_f64(0.2).unwrap()));
+    assert_eq!(weight.max, Some(serde_json::Number::from_f64(0.9).unwrap()));
     assert!((weight.mean.expect("mean") - (0.9 + 0.2 + 0.5) / 3.0).abs() < 1e-9);
     let tags = column(&summary, "tags");
     assert_eq!(tags.data_type, "array");
@@ -82,8 +82,8 @@ fn mixed_types_and_unsupported_extensions_are_reported() {
     let summary = summarize(&data).expect("summary");
     assert_eq!(column(&summary, "a").data_type, "mixed");
     assert_eq!(column(&summary, "a").mean, Some(1.0));
-    assert_eq!(column(&summary, "a").min, Some(1.0));
-    assert_eq!(column(&summary, "a").max, Some(1.0));
+    assert_eq!(column(&summary, "a").min, Some(1.into()));
+    assert_eq!(column(&summary, "a").max, Some(1.into()));
 
     let nulls = dir.path().join("nulls.jsonl");
     std::fs::write(&nulls, "{\"a\":null,\"b\":\"text\"}\n{}\n").expect("write");
@@ -97,4 +97,61 @@ fn mixed_types_and_unsupported_extensions_are_reported() {
     assert!(summarize(&other).is_err());
     let missing = dir.path().join("missing.jsonl");
     assert!(summarize(&missing).is_err());
+}
+
+#[test]
+fn inspect_bounds_rows_columns_and_retained_distinct_values() {
+    use synthflow::inspect::{InspectLimits, summarize_jsonl_with_limits};
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("data.jsonl");
+    let limits = InspectLimits {
+        max_row_bytes: 1024,
+        statistics_bytes: 800,
+        max_columns: 1,
+    };
+    std::fs::write(&path, "{\"x\":1}\n{\"x\":2}\n{\"x\":3}\n").unwrap();
+    let summary = summarize_jsonl_with_limits(&path, limits).unwrap();
+    assert_eq!(column(&summary, "x").distinct, None);
+    assert_eq!(column(&summary, "x").mean, Some(2.0));
+    std::fs::write(&path, "{\"x\":1,\"y\":2}\n").unwrap();
+    assert!(
+        summarize_jsonl_with_limits(&path, limits)
+            .unwrap_err()
+            .to_string()
+            .contains("budget")
+    );
+    std::fs::write(&path, format!("{{\"x\":\"{}\"}}\n", "a".repeat(1024))).unwrap();
+    assert!(
+        summarize_jsonl_with_limits(&path, limits)
+            .unwrap_err()
+            .to_string()
+            .contains("byte limit")
+    );
+}
+
+#[test]
+fn numeric_extrema_preserve_integers_and_finite_means_do_not_overflow() {
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("numeric.jsonl");
+    std::fs::write(&data, "{\"x\":1e308}\n{\"x\":1e308}\n").unwrap();
+    let summary = summarize(&data).unwrap();
+    assert_eq!(column(&summary, "x").mean, Some(1e308));
+    std::fs::write(
+        &data,
+        "{\"x\":9007199254740992.0}\n{\"x\":9007199254740993}\n{\"x\":18446744073709551615}\n",
+    )
+    .unwrap();
+    let summary = summarize(&data).unwrap();
+    assert_eq!(
+        column(&summary, "x").max.as_ref().unwrap().as_u64(),
+        Some(u64::MAX)
+    );
+    assert_eq!(
+        column(&summary, "x").min.as_ref().unwrap().as_f64(),
+        Some(9007199254740992.0)
+    );
+    let json = serde_json::to_value(&summary).unwrap();
+    assert_eq!(json["columns"][0]["max"], serde_json::json!(u64::MAX));
+    std::fs::write(&data, "{\"x\":-1e308}\n{\"x\":1e308}\n").unwrap();
+    assert_eq!(column(&summarize(&data).unwrap(), "x").mean, Some(0.0));
 }
