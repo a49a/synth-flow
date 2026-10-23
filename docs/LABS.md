@@ -42,6 +42,7 @@ accepted = [json.loads(line) for line in output.read_text().splitlines()]
 rejected = [json.loads(line) for line in Path(report['dead_letter_path']).read_text().splitlines()]
 assert report['status'] == 'completed'
 assert len(accepted) == 2 and len(rejected) == 1
+assert rejected[0]["diagnostic"]["instance_path"] == "/answer"
 assert report['sink_state']['committed_source_position'] == 3
 assert output.stat().st_size == report['sink_state']['accepted_bytes']
 assert not Path(report['partial_path']).exists()
@@ -69,6 +70,7 @@ if cargo run -q -p synthflow-cli -- run --strict "$LAB_DIR/pipeline.yaml" > "$LA
 else
     RUN_EXIT=$?
 fi
+test "$RUN_EXIT" -eq 1
 printf 'exit=%s\n' "$RUN_EXIT"
 python3 - <<'PY'
 import json, os
@@ -118,6 +120,7 @@ if cargo run -q -p synthflow-cli -- validate "$LAB_DIR/pipeline.yaml" > "$LAB_DI
 else
     RUN_EXIT=$?
 fi
+test "$RUN_EXIT" -eq 1
 printf 'exit=%s\n' "$RUN_EXIT"
 python3 - <<'PY'
 import json, os
@@ -183,6 +186,7 @@ if cargo run -q -p synthflow-cli -- run "$LAB_DIR/pipeline.yaml" > "$LAB_DIR/sec
 else
     RUN_EXIT=$?
 fi
+test "$RUN_EXIT" -eq 1
 printf 'second exit=%s\n' "$RUN_EXIT"
 python3 - <<'PY'
 import json, os
@@ -277,7 +281,7 @@ cargo run -q -p synthflow-cli -- inspect "$LAB_DIR/output/reliable_demo.jsonl" -
 
 | 作业 / Assignment | 要回答的问题 / Design question | 验收要求 / Acceptance criteria |
 | --- | --- | --- |
-| 批量提交 / Batched commits | 吞吐提升会扩大多大的未提交窗口？ / How much does higher throughput enlarge the uncommitted window? | 正常结束 flush 尾批；故障测试证明清单不引用未同步数据 / Flush the final batch; fault tests prove manifests never refer to unsynchronized data |
+| 按时间提交 / Timed commits | 如何同时限制提交延迟和批次大小？ / How can commit latency and batch size both be bounded? | 在现有 commit_every 基础上增加时间阈值，覆盖空闲与取消 / Extend commit_every with a time limit; cover idle and cancellation cases |
 | 磁盘去重索引 / Disk-backed dedup index | 唯一记录数增长时怎样限制内存？ / How can memory stay bounded as unique records grow? | 索引持久化与检查点一致，恢复输出与内存实现相同 / Keep the persistent index consistent with checkpoints and match in-memory results |
 | SQL 查询 / SQL querying | 如何在 JSONL/Parquet 上限制查询资源？ / How should queries over JSONL/Parquet be bounded? | 查询结果正确，错误可诊断，避免无界内存 / Correct results, diagnosable errors, bounded memory |
 
