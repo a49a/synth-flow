@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+description = "Command-line runner for SynthFlow synthetic data pipelines"
+readme = "README.md"
+keywords = ["synthetic-data", "llm", "pipeline"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "synthflow"
@@ -12,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde_json.workspace = true
-synthflow = { path = "../synthflow" }
+synthflow = { version = "0.1.0", path = "../synthflow" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = "0.7"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+description = "Local-first streaming synthetic data pipelines with checkpoint recovery"
+readme = "README.md"
+keywords = ["synthetic-data", "llm", "pipeline", "parquet"]
+categories = ["command-line-utilities", "science"]
 
 [dependencies]
 async-trait = "0.1"

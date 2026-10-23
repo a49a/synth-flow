@@ -2,13 +2,29 @@ name: Rust
 on: [push, pull_request]
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, '1.93.0']
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
+        if: matrix.rust == 'stable'
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace
       - run: cargo run --locked -p synthflow-cli -- run examples/simple_generation.yaml
+      - run: python3 scripts/check_labs.py
+        if: matrix.rust == 'stable'
+      - run: python3 scripts/benchmark.py --self-test
+        if: matrix.rust == 'stable'
+      - run: cargo package --workspace --locked
+        if: matrix.rust == 'stable'
+      - name: Install CLI in an isolated prefix
+        if: matrix.rust == 'stable'
+        run: python3 scripts/check_install.py
