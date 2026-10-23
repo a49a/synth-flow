@@ -272,7 +272,13 @@ pub async fn resume_with_provider(
     if crate::run::finish_interrupted_publication(&mut prior, &cancellation)? {
         return Ok(prior);
     }
-    let mut dedup = pipeline.dedup.as_ref().map(DedupState::new);
+    let mut dedup = pipeline
+        .dedup
+        .as_ref()
+        .map(|config| {
+            DedupState::with_storage(config, pipeline.dedup_max_bytes, pipeline.dedup_storage)
+        })
+        .transpose()?;
     visit_committed_rows(&prior, &cancellation, |row| {
         if let Some(state) = &mut dedup {
             state.restore(row)?;
@@ -455,7 +461,17 @@ async fn execute(
                 artifacts,
                 report,
                 0,
-                pipeline.dedup.as_ref().map(DedupState::new),
+                pipeline
+                    .dedup
+                    .as_ref()
+                    .map(|config| {
+                        DedupState::with_storage(
+                            config,
+                            pipeline.dedup_max_bytes,
+                            pipeline.dedup_storage,
+                        )
+                    })
+                    .transpose()?,
             )
         }
         Some(context) => {
@@ -578,7 +594,7 @@ async fn execute(
                             match artifacts.write_accepted(outcome.position, &Value::Object(input))? {
                                 WriteResult::Written => {
                                     if let (Some(state), Some(key)) = (&mut dedup, key) {
-                                        state.register(key);
+                                        state.register(key)?;
                                     }
                                     report.statistics.accepted_records_total += 1;
                                     false

@@ -69,6 +69,8 @@ fn minhash_parameters_are_validated() {
         json!({"method": "minhash", "field": "generated.answer", "threshold": 1.5}),
         json!({"method": "minhash", "field": "", "threshold": 0.8}),
         json!({"method": "minhash", "field": "generated.answer", "shingle_words": 0}),
+        json!({"method": "minhash", "field": "generated.answer", "tokenization": "characters", "shingle_chars": 0}),
+        json!({"method": "minhash", "field": "generated.answer", "tokenization": "characters", "shingle_chars": 33}),
     ] {
         let mut spec: Pipeline = serde_json::from_value(json!({
             "version": 1, "dataset": {"name": "minhash"},

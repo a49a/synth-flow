@@ -30,6 +30,15 @@ pub struct Pipeline {
     pub pricing: Option<PricingConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_pricing: BTreeMap<String, PricingConfig>,
+    /// Accounting budget for the in-memory dedup index, not a process RSS limit.
+    #[serde(
+        default = "default_dedup_budget",
+        skip_serializing_if = "is_default_dedup_budget"
+    )]
+    pub dedup_max_bytes: usize,
+    /// Disk indexes are temporary and rebuilt from committed output on resume.
+    #[serde(default, skip_serializing_if = "DedupStorage::is_memory")]
+    pub dedup_storage: DedupStorage,
     #[serde(default)]
     pub errors: ErrorPolicy,
 }
@@ -135,6 +144,12 @@ pub struct RateLimitConfig {
     pub tokens_per_minute: Option<u32>,
 }
 
+fn default_dedup_budget() -> usize {
+    64 * 1024 * 1024
+}
+fn is_default_dedup_budget(value: &usize) -> bool {
+    *value == default_dedup_budget()
+}
 fn default_timeout() -> u64 {
     60_000
 }
@@ -215,7 +230,50 @@ pub enum DedupConfig {
         threshold: f64,
         #[serde(default = "default_shingle_words")]
         shingle_words: usize,
+        #[serde(default, skip_serializing_if = "Tokenization::is_words")]
+        tokenization: Tokenization,
+        #[serde(
+            default = "default_shingle_chars",
+            skip_serializing_if = "is_default_shingle_chars"
+        )]
+        shingle_chars: usize,
     },
+}
+
+/// The memory backend enforces `dedup_max_bytes`; disk uses a bounded SQLite
+/// page cache and a temporary index that is deleted when the run closes.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupStorage {
+    #[default]
+    Memory,
+    Disk,
+}
+impl DedupStorage {
+    fn is_memory(&self) -> bool {
+        matches!(self, Self::Memory)
+    }
+}
+
+/// Character shingles use Unicode scalar values, with whitespace removed.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tokenization {
+    #[default]
+    Words,
+    Characters,
+}
+impl Tokenization {
+    fn is_words(&self) -> bool {
+        matches!(self, Self::Words)
+    }
+}
+
+fn default_shingle_chars() -> usize {
+    3
+}
+fn is_default_shingle_chars(value: &usize) -> bool {
+    *value == default_shingle_chars()
 }
 
 fn default_num_perm() -> u16 {
@@ -344,6 +402,8 @@ impl Pipeline {
                 bands,
                 threshold,
                 shingle_words,
+                shingle_chars,
+                ..
             }) => {
                 if dotted(field) {
                     return Err(invalid("dedup.field must be a non-empty dotted path"));
@@ -363,6 +423,9 @@ impl Pipeline {
                 }
                 if *shingle_words == 0 || *shingle_words > 10 {
                     return Err(invalid("dedup.shingle_words must be in 1..=10"));
+                }
+                if !(1..=32).contains(shingle_chars) {
+                    return Err(invalid("dedup.shingle_chars must be in 1..=32"));
                 }
             }
             None => {}
@@ -527,6 +590,9 @@ impl Pipeline {
                 break;
             }
             ancestor = path.parent();
+        }
+        if self.dedup_max_bytes == 0 {
+            return Err(invalid("dedup_max_bytes must be positive"));
         }
         for (name, pricing) in &self.provider_pricing {
             if !self.providers.contains_key(name) {

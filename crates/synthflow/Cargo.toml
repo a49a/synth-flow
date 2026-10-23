@@ -31,6 +31,7 @@ parquet = { version = "60.0.0", default-features = false, features = ["arrow"] }
 arrow-json = "60.0.0"
 arrow-schema = "60.0.0"
 fs2 = "0.4.3"
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]
 axum = "0.8"
