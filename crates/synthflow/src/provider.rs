@@ -2,7 +2,7 @@ use crate::{
     Error, Result,
     error::ProviderErrorKind,
     ratelimit::{Admission, RateLimiter, estimate_tokens},
-    spec::{MAX_RECORD_BYTES, ProviderConfig, RateLimitConfig, RetryPolicy},
+    spec::{MAX_RECORD_BYTES, ProviderConfig, RateLimitConfig, ResponseFormat, RetryPolicy},
     template,
 };
 use async_trait::async_trait;
@@ -42,6 +42,9 @@ pub struct ProviderStatistics {
     pub retries: u64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Physical responses with reported usage, including rejected or failed replies.
+    #[serde(default)]
+    pub usage_reports: u64,
     pub latency_ms: u64,
 }
 #[derive(Default)]
@@ -50,6 +53,7 @@ struct Metrics {
     retries: AtomicU64,
     prompt: AtomicU64,
     completion: AtomicU64,
+    usage_reports: AtomicU64,
     latency: AtomicU64,
 }
 impl Metrics {
@@ -59,6 +63,7 @@ impl Metrics {
             retries: self.retries.load(Ordering::Relaxed),
             prompt_tokens: self.prompt.load(Ordering::Relaxed),
             completion_tokens: self.completion.load(Ordering::Relaxed),
+            usage_reports: self.usage_reports.load(Ordering::Relaxed),
             latency_ms: self.latency.load(Ordering::Relaxed),
         }
     }
@@ -145,6 +150,12 @@ pub struct OpenAiProvider {
     retry: RetryPolicy,
     limiter: RateLimiter,
     metrics: Metrics,
+    max_completion_tokens: Option<u32>,
+    estimated_completion_tokens: u32,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    seed: Option<i64>,
+    response_format: ResponseFormat,
 }
 impl OpenAiProvider {
     pub fn new(config: &ProviderConfig) -> Result<Self> {
@@ -156,6 +167,12 @@ impl OpenAiProvider {
             timeout_ms,
             retry,
             rate_limit,
+            max_completion_tokens,
+            estimated_completion_tokens,
+            temperature,
+            top_p,
+            seed,
+            response_format,
         } = config
         else {
             return Err(Error::Configuration(
@@ -206,19 +223,16 @@ impl OpenAiProvider {
             retry: retry.clone(),
             limiter: RateLimiter::new(requests_per_minute, tokens_per_minute),
             metrics: Metrics::default(),
+            max_completion_tokens: *max_completion_tokens,
+            estimated_completion_tokens: *estimated_completion_tokens,
+            temperature: *temperature,
+            top_p: *top_p,
+            seed: *seed,
+            response_format: response_format.clone(),
         })
     }
 
-    async fn attempt(
-        &self,
-        request: &GenerateRequest<'_>,
-        attempt: u32,
-    ) -> std::result::Result<GenerateResponse, (Error, Option<Duration>)> {
-        let failure = |kind, status| Error::Provider {
-            kind,
-            status,
-            attempts: attempt,
-        };
+    fn request_body(&self, request: &GenerateRequest<'_>) -> Value {
         // Repair feedback rides in the user message; the base prompt hash stays stable.
         let content = match request.feedback {
             Some(feedback) => format!(
@@ -227,10 +241,51 @@ impl OpenAiProvider {
             ),
             None => request.prompt.to_owned(),
         };
-        let mut builder = self.client.post(&self.endpoint).json(&json!({
+        let mut body = json!({
             "model": self.model, "messages": [{"role":"user", "content": content}],
-            "response_format": {"type":"json_object"}
-        }));
+            "response_format": self.response_format,
+        });
+        for (key, value) in [
+            (
+                "max_completion_tokens",
+                self.max_completion_tokens.map(Value::from),
+            ),
+            ("temperature", self.temperature.map(Value::from)),
+            ("top_p", self.top_p.map(Value::from)),
+            ("seed", self.seed.map(Value::from)),
+        ] {
+            if let Some(value) = value {
+                body[key] = value;
+            }
+        }
+        body
+    }
+
+    fn token_reservation(&self, body: &Value) -> u64 {
+        // Include repair feedback and the schema sent to the model. This is a
+        // model-independent estimate, not a model-specific tokenizer.
+        let messages = body["messages"].to_string();
+        let format = body["response_format"].to_string();
+        estimate_tokens(&messages)
+            .saturating_add(estimate_tokens(&format))
+            .saturating_add(u64::from(
+                self.max_completion_tokens
+                    .unwrap_or(self.estimated_completion_tokens),
+            ))
+    }
+
+    async fn attempt(
+        &self,
+        body: &Value,
+        attempt: u32,
+        admission_id: u64,
+    ) -> std::result::Result<GenerateResponse, (Error, Option<Duration>)> {
+        let failure = |kind, status| Error::Provider {
+            kind,
+            status,
+            attempts: attempt,
+        };
+        let mut builder = self.client.post(&self.endpoint).json(body);
         if let Some(key) = &self.key {
             builder = builder.bearer_auth(key);
         }
@@ -247,23 +302,18 @@ impl OpenAiProvider {
                 None,
             )
         })?;
-        if !response.status().is_success() {
-            let retry_after = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| {
-                    v.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
-                        httpdate::parse_http_date(v)
-                            .ok()
-                            .and_then(|date| date.duration_since(SystemTime::now()).ok())
-                    })
-                });
-            return Err((
-                failure(ProviderErrorKind::Http, Some(response.status().as_u16())),
-                retry_after,
-            ));
-        }
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| {
+                v.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
+                    httpdate::parse_http_date(v)
+                        .ok()
+                        .and_then(|date| date.duration_since(SystemTime::now()).ok())
+                })
+            });
         let mut body = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -275,12 +325,16 @@ impl OpenAiProvider {
             }
             body.extend_from_slice(&chunk);
         }
-        let value: Value = serde_json::from_slice(&body)
-            .map_err(|_| (failure(ProviderErrorKind::InvalidResponse, None), None))?;
-        let text = value
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| (failure(ProviderErrorKind::InvalidResponse, None), None))?;
+        let value: Value = serde_json::from_slice(&body).map_err(|_| {
+            if status.is_success() {
+                (failure(ProviderErrorKind::InvalidResponse, None), None)
+            } else {
+                (
+                    failure(ProviderErrorKind::Http, Some(status.as_u16())),
+                    retry_after,
+                )
+            }
+        })?;
         let prompt_tokens = value
             .pointer("/usage/prompt_tokens")
             .and_then(Value::as_u64);
@@ -293,6 +347,42 @@ impl OpenAiProvider {
         self.metrics
             .completion
             .fetch_add(completion_tokens.unwrap_or(0), Ordering::Relaxed);
+        if prompt_tokens.is_some() || completion_tokens.is_some() {
+            self.metrics.usage_reports.fetch_add(1, Ordering::Relaxed);
+        }
+        if let (Some(prompt), Some(completion)) = (prompt_tokens, completion_tokens) {
+            self.limiter
+                .correct(admission_id, prompt.saturating_add(completion));
+        }
+        // Accounting precedes every semantic check: a refusal, truncated reply,
+        // malformed choice, or HTTP error can still have billable token usage.
+        if !status.is_success() {
+            return Err((
+                failure(ProviderErrorKind::Http, Some(status.as_u16())),
+                retry_after,
+            ));
+        }
+        if value
+            .pointer("/choices/0/message/refusal")
+            .is_some_and(|v| !v.is_null())
+            || value
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                == Some("content_filter")
+        {
+            return Err((failure(ProviderErrorKind::Refusal, None), None));
+        }
+        if value
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            == Some("length")
+        {
+            return Err((failure(ProviderErrorKind::Truncated, None), None));
+        }
+        let text = value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| (failure(ProviderErrorKind::InvalidResponse, None), None))?;
         Ok(GenerateResponse {
             text: text.to_owned(),
             model: value
@@ -332,7 +422,8 @@ impl LlmProvider for OpenAiProvider {
             biased;
             _ = cancellation.cancelled() => Err(Error::Cancelled),
             result = async {
-                let token_estimate = estimate_tokens(request.prompt);
+                let body = self.request_body(&request);
+                let token_estimate = self.token_reservation(&body);
                 for attempt in 1..=self.retry.max_attempts {
                     // Obtain capacity before admitting a physical send. If a
                     // quota is full, release capacity and recheck both budgets
@@ -350,16 +441,11 @@ impl LlmProvider for OpenAiProvider {
                     self.metrics.requests.fetch_add(1, Ordering::Relaxed);
                     if attempt > 1 { self.metrics.retries.fetch_add(1, Ordering::Relaxed); }
                     let started = Instant::now();
-                    let result = tokio::time::timeout(self.timeout, self.attempt(&request, attempt)).await.unwrap_or(Err((Error::Provider { kind: ProviderErrorKind::Timeout, status: None, attempts: attempt }, None)));
+                    let result = tokio::time::timeout(self.timeout, self.attempt(&body, attempt, admission_id)).await.unwrap_or(Err((Error::Provider { kind: ProviderErrorKind::Timeout, status: None, attempts: attempt }, None)));
                     self.metrics.latency.fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                     drop(permit); // Never hold provider capacity during backoff.
                     match result {
                         Ok(response) => {
-                            if let (Some(prompt), Some(completion)) =
-                                (response.prompt_tokens, response.completion_tokens)
-                            {
-                                self.limiter.correct(admission_id, prompt.saturating_add(completion));
-                            }
                             return Ok(response);
                         }
                         Err((error, retry_after)) => {

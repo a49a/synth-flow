@@ -214,6 +214,12 @@ fn network_configuration_and_missing_credentials_are_validated() {
             timeout_ms: 100,
             retry: Default::default(),
             rate_limit: None,
+            max_completion_tokens: None,
+            estimated_completion_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            response_format: Default::default(),
         },
     );
     spec.validate().expect("valid network config");

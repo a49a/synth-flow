@@ -9,6 +9,8 @@ pub enum ProviderErrorKind {
     Network,
     InvalidResponse,
     ResponseTooLarge,
+    Refusal,
+    Truncated,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +91,8 @@ impl Error {
                     ProviderErrorKind::Http => "provider_http",
                     ProviderErrorKind::InvalidResponse => "provider_response",
                     ProviderErrorKind::ResponseTooLarge => "provider_response_size",
+                    ProviderErrorKind::Refusal => "provider_refusal",
+                    ProviderErrorKind::Truncated => "provider_truncated",
                 },
                 "generate",
             ),

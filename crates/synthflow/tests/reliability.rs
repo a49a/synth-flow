@@ -337,7 +337,10 @@ async fn http_retries_transient_errors_and_tracks_usage() {
     assert!(report.succeeded(), "{:?}", report.errors);
     assert_eq!(report.statistics.provider_usage.requests, 3);
     assert_eq!(report.statistics.provider_usage.retries, 2);
-    assert_eq!(report.statistics.provider_usage.prompt_tokens, 7);
+    // Both the 503 response and the successful response carry usage.
+    assert_eq!(report.statistics.provider_usage.prompt_tokens, 14);
+    assert_eq!(report.statistics.provider_usage.usage_reports, 2);
+    assert_eq!(report.statistics.prompt_tokens_total, 7);
     let row: Value = serde_json::from_str(
         fs::read_to_string(&report.output_path)
             .expect("file")

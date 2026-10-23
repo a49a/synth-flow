@@ -11,6 +11,12 @@ providers:
     # api_key_env: LOCAL_LLM_API_KEY
     concurrency: 4
     timeout_ms: 60000
+    max_completion_tokens: 2048
+    # Optional sampling parameters depend on the server/model:
+    # temperature: 0.7
+    # top_p: 0.95
+    # seed: 42
+    response_format: {type: json_object}
     retry:
       max_attempts: 5
       initial_delay_ms: 500

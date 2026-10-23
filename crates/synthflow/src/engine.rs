@@ -12,7 +12,7 @@ use crate::{
 use futures_util::{StreamExt, stream::FuturesOrdered};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Instant};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -51,6 +51,19 @@ pub struct RunStatistics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
     pub provider_usage: ProviderStatistics,
+    #[serde(default)]
+    pub provider_usage_by_name: BTreeMap<String, ProviderStatistics>,
+    #[serde(default)]
+    pub returned_tokens_by_provider: BTreeMap<String, TokenUsage>,
+    #[serde(default)]
+    pub estimated_cost_by_provider: BTreeMap<String, f64>,
+}
+
+/// Token usage returned by completed logical calls included in processed records.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
 }
 
 /// Bounded latency accounting: the mean is exact and incremental, while
@@ -139,6 +152,14 @@ pub struct LatencySummary {
 }
 impl RunStatistics {
     fn merge(&mut self, other: &Self) {
+        for (name, usage) in &other.returned_tokens_by_provider {
+            let entry = self
+                .returned_tokens_by_provider
+                .entry(name.clone())
+                .or_default();
+            entry.prompt_tokens += usage.prompt_tokens;
+            entry.completion_tokens += usage.completion_tokens;
+        }
         self.generation_requests_total += other.generation_requests_total;
         self.generation_success_total += other.generation_success_total;
         self.generation_failed_total += other.generation_failed_total;
@@ -464,6 +485,7 @@ async fn execute(
     let tools = StageTools {
         env: &env,
         provider: provider.as_ref(),
+        provider_name: &pipeline.generate.provider,
         schema: &schema,
         regenerate_on_invalid: pipeline.generate.regenerate_on_invalid,
         judge: judge.as_ref(),
@@ -574,7 +596,7 @@ async fn execute(
                     true
                 }
             };
-            refresh(&mut report, started, provider.as_ref(), pipeline);
+            refresh(&mut report, started, provider.as_ref(), judge.as_ref(), pipeline);
             artifacts.commit(&mut report, outcome.position, outcome.source_byte_offset)?;
             if report.statistics.processed_records_total - progress_count >= 500
                 || progress_at.elapsed() >= std::time::Duration::from_secs(2)
@@ -615,7 +637,13 @@ async fn execute(
         Ok(())
     }.await;
     drop(pending); // Cancels in-flight HTTP work without detached tasks.
-    refresh(&mut report, started, provider.as_ref(), pipeline);
+    refresh(
+        &mut report,
+        started,
+        provider.as_ref(),
+        judge.as_ref(),
+        pipeline,
+    );
     // Percentiles are computed once at report time, never per record.
     report.statistics.latency = latencies.summary();
     report.statistics.latency_calls_total = latencies.count;
@@ -674,19 +702,61 @@ fn refresh(
     report: &mut RunReport,
     started: Instant,
     provider: &dyn LlmProvider,
+    judge: Option<&JudgeTools>,
     pipeline: &Pipeline,
 ) {
     report.statistics.elapsed_seconds = started.elapsed().as_secs_f64();
     report.statistics.records_per_second = report.statistics.processed_records_total as f64
         / report.statistics.elapsed_seconds.max(f64::EPSILON);
-    report.statistics.provider_usage = provider.statistics();
-    if let Some(pricing) = &pipeline.pricing {
-        report.statistics.estimated_cost_usd = Some(
-            (report.statistics.prompt_tokens_total as f64 * pricing.input_usd_per_mtok
-                + report.statistics.completion_tokens_total as f64 * pricing.output_usd_per_mtok)
-                / 1_000_000.0,
-        );
+    let stats = &mut report.statistics;
+    stats
+        .provider_usage_by_name
+        .insert(pipeline.generate.provider.clone(), provider.statistics());
+    if let Some(judge) = judge
+        && judge.provider_name != pipeline.generate.provider
+    {
+        stats
+            .provider_usage_by_name
+            .insert(judge.provider_name.clone(), judge.provider.statistics());
     }
+    stats.provider_usage = ProviderStatistics::default();
+    for usage in stats.provider_usage_by_name.values() {
+        stats.provider_usage.requests += usage.requests;
+        stats.provider_usage.retries += usage.retries;
+        stats.provider_usage.prompt_tokens += usage.prompt_tokens;
+        stats.provider_usage.completion_tokens += usage.completion_tokens;
+        stats.provider_usage.latency_ms += usage.latency_ms;
+        stats.provider_usage.usage_reports += usage.usage_reports;
+    }
+    stats.estimated_cost_by_provider.clear();
+    let mut complete = pipeline.pricing.is_some() || !pipeline.provider_pricing.is_empty();
+    let mut billable = stats.returned_tokens_by_provider.clone();
+    for (name, usage) in &stats.provider_usage_by_name {
+        if usage.usage_reports > 0 {
+            billable.insert(
+                name.clone(),
+                TokenUsage {
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                },
+            );
+        }
+    }
+    for (name, usage) in &billable {
+        if let Some(pricing) = pipeline
+            .provider_pricing
+            .get(name)
+            .or(pipeline.pricing.as_ref())
+        {
+            let cost = (usage.prompt_tokens as f64 * pricing.input_usd_per_mtok
+                + usage.completion_tokens as f64 * pricing.output_usd_per_mtok)
+                / 1_000_000.0;
+            stats.estimated_cost_by_provider.insert(name.clone(), cost);
+        } else {
+            complete = false;
+        }
+    }
+    stats.estimated_cost_usd = complete.then(|| stats.estimated_cost_by_provider.values().sum());
 }
 
 async fn source_fingerprint(
@@ -767,6 +837,7 @@ struct Outcome {
 struct StageTools<'a> {
     env: &'a minijinja::Environment<'a>,
     provider: &'a dyn LlmProvider,
+    provider_name: &'a str,
     schema: &'a jsonschema::Validator,
     regenerate_on_invalid: u32,
     judge: Option<&'a JudgeTools>,
@@ -811,6 +882,12 @@ async fn process(
             })?;
             statistics.prompt_tokens_total += response.prompt_tokens.unwrap_or(0);
             statistics.completion_tokens_total += response.completion_tokens.unwrap_or(0);
+            let usage = statistics
+                .returned_tokens_by_provider
+                .entry(tools.provider_name.to_owned())
+                .or_default();
+            usage.prompt_tokens += response.prompt_tokens.unwrap_or(0);
+            usage.completion_tokens += response.completion_tokens.unwrap_or(0);
             statistics.generation_success_total += 1;
             attempts += response.attempts.max(1);
             let structured = serde_json::from_str::<Value>(&response.text)
@@ -925,6 +1002,12 @@ async fn judge_record(
     })?;
     statistics.prompt_tokens_total += response.prompt_tokens.unwrap_or(0);
     statistics.completion_tokens_total += response.completion_tokens.unwrap_or(0);
+    let usage = statistics
+        .returned_tokens_by_provider
+        .entry(tools.provider_name.clone())
+        .or_default();
+    usage.prompt_tokens += response.prompt_tokens.unwrap_or(0);
+    usage.completion_tokens += response.completion_tokens.unwrap_or(0);
     let verdict = serde_json::from_str::<Value>(&response.text)
         .map_err(|_| {
             statistics.judge_failed_total += 1;

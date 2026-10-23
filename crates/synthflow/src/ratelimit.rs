@@ -85,7 +85,10 @@ impl RateLimiter {
     }
 }
 pub(crate) fn estimate_tokens(prompt: &str) -> u64 {
-    prompt.chars().count() as u64 / 4 + 32
+    // Avoid treating an entire unspaced CJK passage as a handful of tokens.
+    // Reserve one token per UTF-8 byte plus message overhead. This is an
+    // intentionally conservative, tokenizer-independent heuristic.
+    (prompt.len() as u64).saturating_add(32)
 }
 
 #[cfg(test)]
@@ -129,6 +132,7 @@ mod tests {
     #[test]
     fn token_estimate_scales_with_prompt_length() {
         assert_eq!(estimate_tokens(""), 32);
-        assert_eq!(estimate_tokens(&"x".repeat(400)), 132);
+        assert_eq!(estimate_tokens(&"x".repeat(400)), 432);
+        assert_eq!(estimate_tokens("中文"), 38);
     }
 }

@@ -28,6 +28,8 @@ pub struct Pipeline {
     pub output: Output,
     #[serde(default)]
     pub pricing: Option<PricingConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_pricing: BTreeMap<String, PricingConfig>,
     #[serde(default)]
     pub errors: ErrorPolicy,
 }
@@ -66,7 +68,56 @@ pub enum ProviderConfig {
         retry: RetryPolicy,
         #[serde(default)]
         rate_limit: Option<RateLimitConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_completion_tokens: Option<u32>,
+        /// Output reservation used for TPM when no generation cap is configured.
+        #[serde(
+            default = "default_estimated_completion_tokens",
+            skip_serializing_if = "is_default_estimated_completion_tokens"
+        )]
+        estimated_completion_tokens: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        temperature: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        top_p: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<i64>,
+        #[serde(default, skip_serializing_if = "ResponseFormat::is_default")]
+        response_format: ResponseFormat,
     },
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResponseFormat {
+    #[default]
+    JsonObject,
+    Text,
+    JsonSchema {
+        json_schema: Box<ResponseJsonSchema>,
+    },
+}
+
+impl ResponseFormat {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::JsonObject)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseJsonSchema {
+    pub name: String,
+    pub schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+fn default_estimated_completion_tokens() -> u32 {
+    1024
+}
+fn is_default_estimated_completion_tokens(value: &u32) -> bool {
+    *value == default_estimated_completion_tokens()
 }
 
 /// USD per one million tokens; reports carry an estimated cost.
@@ -350,7 +401,50 @@ impl Pipeline {
                     timeout_ms,
                     retry,
                     rate_limit,
+                    max_completion_tokens,
+                    estimated_completion_tokens,
+                    temperature,
+                    top_p,
+                    response_format,
+                    ..
                 } => {
+                    if max_completion_tokens.is_some_and(|tokens| tokens == 0)
+                        || *estimated_completion_tokens == 0
+                    {
+                        return Err(invalid(
+                            "provider completion token budgets must be positive",
+                        ));
+                    }
+                    if temperature
+                        .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+                    {
+                        return Err(invalid("provider temperature must be in 0..=2"));
+                    }
+                    if top_p
+                        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+                    {
+                        return Err(invalid("provider top_p must be in 0..=1"));
+                    }
+                    if let ResponseFormat::JsonSchema { json_schema } = response_format {
+                        if json_schema.name.is_empty()
+                            || json_schema.name.len() > 64
+                            || !json_schema
+                                .name
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                        {
+                            return Err(invalid(
+                                "provider response schema name must contain 1..=64 ASCII letters, digits, underscores or hyphens",
+                            ));
+                        }
+                        if !json_schema.schema.is_object()
+                            || jsonschema::validator_for(&json_schema.schema).is_err()
+                        {
+                            return Err(invalid(
+                                "provider response_format requires a valid JSON schema object",
+                            ));
+                        }
+                    }
                     if *timeout_ms == 0
                         || *timeout_ms > 3_600_000
                         || retry.max_attempts == 0
@@ -433,6 +527,19 @@ impl Pipeline {
                 break;
             }
             ancestor = path.parent();
+        }
+        for (name, pricing) in &self.provider_pricing {
+            if !self.providers.contains_key(name) {
+                return Err(invalid("provider_pricing references an unknown provider"));
+            }
+            if [pricing.input_usd_per_mtok, pricing.output_usd_per_mtok]
+                .into_iter()
+                .any(|v| !v.is_finite() || v < 0.0)
+            {
+                return Err(invalid(
+                    "provider_pricing values must be finite and non-negative",
+                ));
+            }
         }
         if let Some(pricing) = &self.pricing
             && [pricing.input_usd_per_mtok, pricing.output_usd_per_mtok]

@@ -164,3 +164,97 @@ async fn latency_counts_failed_calls_and_judge_calls() {
     assert_eq!(report.statistics.latency_calls_total, 3);
     assert!(report.statistics.latency.mean_ms >= 10.0);
 }
+
+#[tokio::test]
+async fn separate_http_providers_report_usage_and_different_prices() {
+    use axum::{Json, Router, routing::post};
+    let app = Router::new()
+        .route(
+            "/generator/chat/completions",
+            post(|| async {
+                Json(
+                    json!({"choices":[{"message":{"content":"{\"answer\":\"ok\",\"score\":1}"}}],
+                "usage":{"prompt_tokens":1000,"completion_tokens":500}}),
+                )
+            }),
+        )
+        .route(
+            "/judge/chat/completions",
+            post(|| async {
+                Json(json!({"choices":[{"message":{"content":"{\"score\":1}"}}],
+                "usage":{"prompt_tokens":2000,"completion_tokens":100}}))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = fixture(&dir, json!([{"topic":"a"}]), None);
+    for name in ["generator", "judge"] {
+        spec.providers.insert(
+            name.into(),
+            serde_json::from_value(json!({
+                "type":"openai_compatible", "base_url":format!("http://{addr}/{name}"), "model":name
+            }))
+            .unwrap(),
+        );
+    }
+    spec.judge = Some(
+        serde_json::from_value(json!({"provider":"judge","prompt":"score","min_score":0.5}))
+            .unwrap(),
+    );
+    spec.provider_pricing = serde_json::from_value(json!({
+        "generator":{"input_usd_per_mtok":10,"output_usd_per_mtok":20},
+        "judge":{"input_usd_per_mtok":1,"output_usd_per_mtok":2}
+    }))
+    .unwrap();
+    let report = synthflow::run_async(&spec, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(report.succeeded(), "{:?}", report.errors);
+    let stats = report.statistics;
+    assert_eq!(stats.provider_usage.requests, 2);
+    assert_eq!(stats.provider_usage.prompt_tokens, 3000);
+    assert_eq!(stats.provider_usage_by_name["judge"].requests, 1);
+    assert_eq!(
+        stats.returned_tokens_by_provider["judge"].completion_tokens,
+        100
+    );
+    assert!((stats.estimated_cost_by_provider["generator"] - 0.02).abs() < 1e-9);
+    assert!((stats.estimated_cost_usd.unwrap() - 0.0222).abs() < 1e-9);
+    spec.output.path = dir.path().join("shared.jsonl");
+    spec.judge.as_mut().unwrap().provider = "generator".into();
+    let shared = synthflow::run_async(&spec, CancellationToken::new())
+        .await
+        .unwrap();
+    server.abort();
+    assert!(shared.succeeded(), "{:?}", shared.errors);
+    assert_eq!(shared.statistics.provider_usage_by_name.len(), 1);
+    assert_eq!(shared.statistics.provider_usage.requests, 2);
+    assert_eq!(shared.statistics.provider_usage.prompt_tokens, 2000);
+    assert!((shared.statistics.estimated_cost_usd.unwrap() - 0.04).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn missing_provider_price_does_not_report_a_partial_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = fixture(&dir, json!([{"topic":"a"}]), None);
+    spec.providers.insert(
+        "judge".into(),
+        serde_json::from_value(json!({"type":"mock","response":"{\"score\":1}"})).unwrap(),
+    );
+    spec.judge = Some(
+        serde_json::from_value(json!({"provider":"judge","prompt":"score","min_score":0.5}))
+            .unwrap(),
+    );
+    spec.provider_pricing.insert(
+        "generator".into(),
+        serde_json::from_value(json!({"input_usd_per_mtok":1,"output_usd_per_mtok":1})).unwrap(),
+    );
+    let report = synthflow::run_async(&spec, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(report.succeeded());
+    assert!(report.statistics.estimated_cost_usd.is_none());
+    assert_eq!(report.statistics.estimated_cost_by_provider.len(), 1);
+}
