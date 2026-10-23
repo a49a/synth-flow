@@ -1,5 +1,7 @@
 # SynthFlow — Rust Synthetic Data Pipeline Engine
 
+> Historical design blueprint, not the current configuration reference. See [README](README.md) and [current capability status](docs/STATUS.md). Current recovery uses `synthflow resume pipeline.yaml`; Phase 13 currently provides basic Arrow-backed inspection, not DataFusion SQL.
+
 > This document is intended to be consumed directly by an AI coding agent.
 > Implement incrementally. Prioritize correctness, resumability, observability, and bounded-memory execution before distributed execution or advanced optimization.
 

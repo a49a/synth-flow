@@ -45,7 +45,10 @@ flowchart LR
 | [dedup.rs](../crates/synthflow/src/dedup.rs) | 精确与 MinHash 去重 / Exact and MinHash deduplication |
 | [inspect.rs](../crates/synthflow/src/inspect.rs) | JSONL/Parquet 数据集统计 / JSONL/Parquet dataset statistics |
 | [engine.rs](../crates/synthflow/src/engine.rs) | 调度、处理、策略和统计 / Scheduling, processing, policies, statistics |
-| [run.rs](../crates/synthflow/src/run.rs) | 运行清单、同步与发布 / Manifests, synchronization, publication |
+| [run.rs](../crates/synthflow/src/run.rs) | 运行清单、前缀摘要、同步与发布 / Manifests, prefix digests, synchronization, publication |
+| [blocking.rs](../crates/synthflow/src/blocking.rs) / [storage_worker.rs](../crates/synthflow/src/storage_worker.rs) | 有界专用文件 I/O 线程与串行存储操作 / Bounded dedicated file I/O threads and serialized storage operations |
+| [parquet_schema.rs](../crates/synthflow/src/parquet_schema.rs) | 显式输出契约与无损类型检查 / Explicit output contracts and lossless type checks |
+| [progress.rs](../crates/synthflow/src/progress.rs) | 独立定时进度快照 / Independently timed progress snapshots |
 | [record.rs](../crates/synthflow/src/record.rs) | 记录身份和 lineage / Record identity and lineage |
 | [error.rs](../crates/synthflow/src/error.rs) | 分类错误和安全诊断 / Classified errors and safe diagnostics |
 
@@ -53,9 +56,9 @@ flowchart LR
 
 **English**: Start at the CLI's `execute`, follow `Pipeline::load`, then `run_async → run_with_provider → process`. `process` handles one record; `run_with_provider` controls admission and commit timing. Separating these responsibilities keeps record processing testable and allows scheduling to evolve independently.
 
-**中文**：当前只有核心库与 CLI 两个 crate。crate 边界不是越多越好：拆分应帮助管理依赖和公共接口。文件 I/O 仍有同步部分，不能因为入口使用 Tokio 就把整个系统称为非阻塞。
+**中文**：当前只有核心库与 CLI 两个 crate。crate 边界不是越多越好：拆分应帮助管理依赖和公共接口。文件 I/O 仍是同步系统调用，但源读取和存储由专用线程及容量为 1 的任务通道承接，避免阻塞 Tokio 的异步工作线程；等待期间仍可处理网络、定时器和取消。
 
-**English**: There are two crates: the core library and the CLI. More crate boundaries are not automatically better; splitting should improve dependency management and public interfaces. File I/O still includes synchronous operations, so a Tokio entry point does not make the entire system nonblocking.
+**English**: There are two crates: the core library and the CLI. More crate boundaries are not automatically better; splitting should improve dependency management and public interfaces. File I/O still uses synchronous system calls, but dedicated source and storage threads with one-slot job channels keep those calls off Tokio's async workers. Network operations, timers, and cancellation can progress while I/O is pending.
 
 ## 3. 配置也是数据契约 / Configuration is a data contract
 
@@ -156,9 +159,9 @@ pub trait LlmProvider: Send + Sync {
 
 **English**: This design accepts head-of-line blocking in exchange for simple ordered commits. A separate semaphore inside the provider limits active HTTP attempts even when callers bypass the engine. The window controls memory and scheduling; the semaphore controls provider requests. They are different limits.
 
-**中文**：核心调度窗口的内存随并发数和单条数据大小增长；去重索引仍随唯一记录数增长；恢复时逐行读取已接受前缀。8 MiB 上限分别约束源行、模板输出和 HTTP 响应等，不代表每个在途记录的所有拷贝合计只占 8 MiB，也不代表严格的进程内存配额。inline 源仍整体加载。
+**中文**：核心调度窗口的内存随并发数和单条数据大小增长；默认内存去重索引受记账预算限制，`dedup_storage: disk` 则使用临时 SQLite 索引和有界页缓存；恢复时逐行读取已接受前缀重建所选索引。8 MiB 上限分别约束源行、模板输出和 HTTP 响应等，不代表每个在途记录的所有拷贝合计只占 8 MiB，也不代表严格的进程内存配额。inline 源仍整体加载。
 
-**English**: The core scheduling window's memory grows with concurrency and record size; the dedup index still grows with unique record count, but resume reads accepted rows one at a time. Separate 8 MiB limits apply to source lines, template output, HTTP responses, and related inputs; they are not a combined 8 MiB budget per record or a strict process memory quota. Inline sources are still loaded as a whole.
+**English**: The core scheduling window's memory grows with concurrency and record size; the default memory dedup index has an accounting budget, while `dedup_storage: disk` uses a temporary SQLite index with a bounded page cache. Resume rebuilds the selected index from accepted rows one at a time. Separate 8 MiB limits apply to source lines, template output, HTTP responses, and related inputs; they are not a combined 8 MiB budget per record or a strict process memory quota. Inline sources are still loaded as a whole.
 
 ## 7. 错误、重试和取消 / Errors, retries, and cancellation
 
@@ -167,11 +170,11 @@ pub trait LlmProvider: Send + Sync {
 | HTTP 429 / 502 / 503 / 504 | 在次数限制内重试 / Retry within the attempt limit |
 | 网络失败、超时 / Network failure, timeout | 在次数限制内重试 / Retry within the attempt limit |
 | HTTP 400 / 401 / 403 | 不重试该调用，形成记录拒绝 / Do not retry the call; reject the record |
-| 非法生成 JSON、Schema 不匹配 / Invalid generated JSON, schema mismatch | 按 `generate.on_error` 决定拒绝或带反馈重新生成 / Reject or regenerate with feedback according to `generate.on_error` |
+| 非法生成 JSON、Schema 不匹配 / Invalid generated JSON, schema mismatch | 按 `generate.regenerate_on_invalid` 决定拒绝或带反馈重新生成 / Reject or regenerate with feedback according to `generate.regenerate_on_invalid` |
 | judge 分数不足或输出无效 / Low judge score or invalid judge output | 拒绝记录 / Reject the record |
 | 去重命中或字段缺失 / Duplicate or missing dedup field | 拒绝记录；只登记 sink 接受的键 / Reject the record; register keys only after sink acceptance |
 | 源解析错误、sink 失败 / Source parse error, sink failure | 终止运行 / Terminate the run |
-| 第一次 Ctrl+C / First Ctrl+C | 取消在途任务并保存状态 / Cancel in-flight work and save state |
+| 第一次 Ctrl+C 或 Unix SIGTERM / First Ctrl+C or Unix SIGTERM | 取消在途任务并保存状态；再次收到终止信号立即退出 / Cancel in-flight work and save state; a second termination signal exits immediately |
 
 **中文**：`max_attempts` 包括首次请求。指数退避先计算上限，再加入随机抖动；permit 在休眠前释放，避免重试中的请求占着容量不做工作。超时覆盖单次 HTTP 尝试的发送和响应读取，不覆盖等待 permit 或退避时间。`Retry-After` 在当前实现中仍受 `max_delay_ms` 限制，这是策略选择，也可能比服务端建议的等待时间短。
 
@@ -181,15 +184,15 @@ pub trait LlmProvider: Send + Sync {
 
 **English**: The semaphore controls concurrency; optional RPM/TPM settings limit requests/tokens in a 60-second sliding window, counting each retry separately. Retries do not imply request idempotency. A server may continue processing or billing after a timeout or client cancellation. Tokens and `tokio::select!` stop waiting, and in-flight futures are dropped; this does not guarantee remote rollback.
 
-**中文**：失败策略决定记录拒绝是否升级成运行失败。strict 首次拒绝即停止；最大拒绝数在每条提交后检查；最终拒绝比例在源结束后检查。非空数据全部拒绝时始终失败，空输入可以成功。
+**中文**：失败策略决定记录拒绝是否升级成运行失败。strict 首次拒绝即停止；最大拒绝数在每条处理后检查；最终拒绝比例在源结束后检查。非空数据全部拒绝时始终失败，空输入可以成功。
 
-**English**: Failure policy decides when record rejection becomes run failure. Strict mode stops at the first rejection; the maximum rejected count is checked after each record commit; the final rejected ratio is checked after the source ends. Rejecting every record in a nonempty input always fails; an empty input can succeed.
+**English**: Failure policy decides when record rejection becomes run failure. Strict mode stops at the first rejection; the maximum rejected count is checked after each processed record; the final rejected ratio is checked after the source ends. Rejecting every record in a nonempty input always fails; an empty input can succeed.
 
 ## 8. 从写入到持久化 / From writing to durability
 
-**中文**：`write_all` 返回成功说明字节已交给写入接口，并不单独证明持久化完成。`Artifacts::commit` 同步 accepted/rejected 文件，计算字节位置与记录数，再写临时 manifest、同步临时文件、替换旧 manifest 并同步目录。先提交数据，再发布描述数据的位置，是这里的关键顺序。
+**中文**：`write_all` 返回成功说明字节已交给写入接口，并不单独证明持久化完成。`Artifacts::commit` 同步 accepted/rejected 文件，保存字节位置、记录数及写入期间增量维护的 BLAKE3 摘要，再写临时 manifest、同步临时文件、替换旧 manifest 并同步目录。先提交数据，再发布描述数据的位置，是这里的关键顺序。
 
-**English**: A successful `write_all` means bytes reached the write interface; by itself, it does not establish durability. `Artifacts::commit` synchronizes accepted/rejected files, computes offsets and counts, writes a temporary manifest, syncs it, replaces the old manifest, and syncs the directory. Data must precede publication of the metadata that describes it.
+**English**: A successful `write_all` means bytes reached the write interface; by itself, it does not establish durability. `Artifacts::commit` synchronizes accepted/rejected files and records offsets, counts, and BLAKE3 digests maintained incrementally during writes, writes a temporary manifest, syncs it, replaces the old manifest, and syncs the directory. Data must precede publication of the metadata that describes it.
 
 ```text
 write row → sync accepted + rejected → update sink_state
@@ -236,9 +239,9 @@ stateDiagram-v2
 
 **English**: Top-level statistics describe processing; `sink_state` describes commit positions. During concurrent cancellation, started requests may not be merged into record-level statistics, even though provider request counters have increased. `generation_success_total` means the provider returned successfully; schema rejection can follow. HTTP latency is accumulated across attempts, not an average. Missing token usage contributes zero but does not imply zero actual cost.
 
-**中文**：库的 `run_async` 返回 `Result<RunReport>`。`Err` 表示没有成功建立/返回完整运行报告；`Ok(report)` 也可能包含 failed 或 cancelled，必须检查 `report.succeeded()`。CLI 将 completed 映射为 0、一般失败为 1、正常处理的取消为 130；命令行参数解析错误由 clap 处理。不要把 Result 的 Ok 与业务成功混为一谈。
+**中文**：库的 `run_async` 返回 `Result<RunReport>`。`Err` 表示没有成功建立/返回完整运行报告；`Ok(report)` 也可能包含 failed 或 cancelled，必须检查 `report.succeeded()`。CLI 将 completed 映射为 0、一般失败为 1、Ctrl+C 取消为 130、Unix SIGTERM 取消为 143；命令行参数解析错误由 clap 处理。不要把 Result 的 Ok 与业务成功混为一谈。
 
-**English**: The library's `run_async` returns `Result<RunReport>`. `Err` means a complete run report could not be established/returned; `Ok(report)` can still contain failed or cancelled, so check `report.succeeded()`. The CLI maps completed to 0, general failure to 1, and handled cancellation to 130; clap handles argument-parsing errors. Do not confuse Result's Ok with business success.
+**English**: The library's `run_async` returns `Result<RunReport>`. `Err` means a complete run report could not be established/returned; `Ok(report)` can still contain failed or cancelled, so check `report.succeeded()`. The CLI maps completed to 0, general failure to 1, Ctrl+C cancellation to 130, and Unix SIGTERM cancellation to 143; clap handles argument-parsing errors. Do not confuse Result's Ok with business success.
 
 ## 10. 用测试学习边界 / Learn boundaries through tests
 
@@ -252,7 +255,8 @@ stateDiagram-v2
 | [reliability.rs](../crates/synthflow/tests/reliability.rs) | 可注入 provider、本地 HTTP、并发、发布竞争 / Injected providers, local HTTP, concurrency, publication races |
 | [cli.rs](../crates/synthflow-cli/tests/cli.rs) | 二进制命令与示例 / Binary commands and examples |
 | [faults.rs](../crates/synthflow-cli/tests/faults.rs) | 子进程、鉴权、信号和强制终止 / Subprocesses, authentication, signals, forced termination |
-| [run.rs 内部测试 / Internal tests](../crates/synthflow/src/run.rs) | 可失败的 Write 接口 / A failing Write implementation |
+| [run.rs 内部测试 / Internal tests](../crates/synthflow/src/run.rs) | 写入失败、双前缀篡改、回滚摘要及初始化恢复 / Write failure, tampered prefixes, rollback digests, and initialization recovery |
+| [parquet.rs](../crates/synthflow/tests/parquet.rs) | 首条空值、数组、可选字段、大整数与恢复后的固定 Schema / Initial nulls, arrays, optional fields, large integers, and stable schemas on resume |
 
 **中文**：故障注入不等于验证所有文件系统崩溃情形；本地 HTTP server 也不证明所有模型服务都兼容。显式 `resume` 在持有锁并校验源与配置后，可以恢复 failed/cancelled/running/publishing。已有正式文件须匹配预先保存的发布摘要；旧清单缺少摘要或文件冲突仍需人工检查。远端 provider 不保证恰好执行一次。
 
@@ -260,20 +264,41 @@ stateDiagram-v2
 
 ## 11. 读懂新阶段 / Understand the later stages
 
-**中文**：CSV 源按逻辑行读取，以表头命名字段，值保持字符串。结构化输出失败时，可选的重新生成将安全的错误路径作为 `feedback` 再次调用 provider；它与 HTTP 传输重试是两个独立计数。通过 Schema 后，可选 judge 对生成对象评分；之后精确或 MinHash 去重检查完整记录，只有 sink 接受时才登记去重键。Parquet 的首条接受记录决定 Arrow Schema，后续不兼容记录进入 dead-letter。
+**中文**：CSV 源按逻辑行读取，以表头命名字段，值保持字符串。结构化输出失败时，可选的重新生成将安全的错误路径作为 `feedback` 再次调用 provider；它与 HTTP 传输重试是两个独立计数。通过 Schema 后，可选 judge 对生成对象评分；之后精确或 MinHash 去重检查完整记录，只有 sink 接受时才登记去重键。Parquet 可通过 `output.schema` 明确指定字段类型、可空与必填约束，并自动补充 `_meta`；未配置时仍由首条接受记录推断。校验、发布和恢复使用同一 Schema，额外字段或有损数值转换进入 dead-letter。配置与例子见 [Parquet Schema](PARQUET_SCHEMA.md)。
 
-**English**: The CSV source reads logical rows, names fields from the header, and keeps values as strings. Optional regeneration sends safe error-path feedback to the provider after structured-output failure; it has a separate count from HTTP transport retries. After schema validation, the optional judge scores the generated object. Exact or MinHash deduplication then checks the full record and registers a key only after sink acceptance. The first accepted Parquet row defines its Arrow schema; incompatible later rows go to the dead-letter file.
+**English**: The CSV source reads logical rows, names fields from the header, and keeps values as strings. Optional regeneration sends safe error-path feedback to the provider after structured-output failure; it has a separate count from HTTP transport retries. After schema validation, the optional judge scores the generated object. Exact or MinHash deduplication then checks the full record and registers a key only after sink acceptance. Parquet accepts an explicit `output.schema` for types, nullability, and required fields, adding `_meta` automatically. Otherwise it infers from the first accepted row. Validation, publication, and resume use the same schema; extra fields and lossy numeric casts go to the dead-letter file. See [Parquet schemas](PARQUET_SCHEMA.md) for configuration and examples.
 
-**中文**：`resume` 获取输出命名空间的独占文件锁，验证中断清单的配置 hash 与源指纹，将 partial/dead-letter 截断到已提交字节，然后从下一条源位置继续。已接受前缀还用于重建去重状态和 Parquet Schema。失败策略必须对前缀与新增记录合计检查。Parquet 发布保留 JSONL partial，直到独立的 Parquet 文件和 completed 清单都持久化。
+**中文**：`resume` 获取输出命名空间的独占文件锁，验证中断清单的配置 hash 与源指纹，并先校验 accepted/rejected 两个已提交前缀的摘要、长度与行数，再将 partial/dead-letter 截断到已提交字节，然后从下一条源位置继续。已接受前缀还用于重建去重状态和 Parquet Schema。Parquet 在修改任何数据文件或清单前，逐行复核已提交数据的无损类型约束；旧版不兼容前缀即使摘要匹配也拒绝恢复，保留原产物。失败策略必须对前缀与新增记录合计检查。Parquet 发布保留 JSONL partial，直到独立的 Parquet 文件和 completed 清单都持久化。
 
-**English**: `resume` takes an exclusive file lock for the output namespace, checks the interrupted manifest against the configuration hash and source fingerprint, truncates partial/dead-letter files to committed bytes, and continues after the committed source position. Accepted rows rebuild deduplication state and the Parquet schema. Failure policies apply to the combined old and new counts. Parquet publication keeps the JSONL partial until the independent Parquet file and completed manifest are durable.
+**English**: `resume` takes an exclusive file lock for the output namespace, checks the configuration hash and source fingerprint, verifies the digests, lengths, and row counts of both committed prefixes before modifying either file, then truncates partial/dead-letter files to committed bytes, and continues after the committed source position. Accepted rows rebuild deduplication state and the Parquet schema. Before modifying data files or the manifest, Parquet resume also rechecks every committed row for lossless type compatibility. Incompatible historical prefixes are refused with artifacts preserved, even when their digests match. Failure policies apply to the combined old and new counts. Parquet publication keeps the JSONL partial until the independent Parquet file and completed manifest are durable.
 
-**中文**：`inspect` 读取已发布 JSONL/Parquet，统计顶层列、空值、基数与数值范围。混合列的均值只用数值项求和及计数；没有数值项时为 null。延迟均值使用增量统计，分位数来自最多 4096 个均匀蓄水池样本，超过该数量时是近似值。去重索引仍随唯一记录数增长，但恢复不再缓存整份已接受前缀。新清单保存 JSONL/CSV 字节偏移，直接定位下一条记录；旧清单仍支持扫描跳过。源指纹校验仍需要全文件读取。
+**中文**：`inspect` 读取已发布 JSONL/Parquet，统计顶层列、空值、基数与数值范围。混合列的均值只用数值项求和及计数；没有数值项时为 null。延迟均值使用增量统计，分位数来自最多 4096 个均匀蓄水池样本，超过该数量时是近似值。内存去重索引仍随唯一记录数增长，磁盘模式将其保存在临时 SQLite 中；两种模式恢复都不缓存整份已接受前缀。新清单保存 JSONL/CSV 字节偏移，直接定位下一条记录；旧清单仍支持扫描跳过。源指纹校验仍需要全文件读取。
 
-**English**: `inspect` reads published JSONL/Parquet and summarizes top-level columns, nulls, distinct counts, and numeric ranges. A mixed column's mean uses numeric values and their count only; it is null when there are no numbers. Latency mean is incremental, while percentiles use a uniform reservoir of at most 4096 observations and become approximate above that size. The dedup index still grows with unique records, but resume no longer buffers the accepted prefix. New manifests store JSONL/CSV byte offsets to seek to the next record; older manifests still support scanning and skipping. Source fingerprint checks still read the whole file.
+**English**: `inspect` reads published JSONL/Parquet and summarizes top-level columns, nulls, distinct counts, and numeric ranges. A mixed column's mean uses numeric values and their count only; it is null when there are no numbers. Latency mean is incremental, while percentiles use a uniform reservoir of at most 4096 observations and become approximate above that size. The memory dedup index grows with unique records; disk mode keeps the index in temporary SQLite storage. Neither mode buffers the entire accepted prefix during resume. New manifests store JSONL/CSV byte offsets to seek to the next record; older manifests still support scanning and skipping. Source fingerprint checks still read the whole file.
 
 **中文**：RPM/TPM 在 HTTP 发送前联合检查；预算不足时释放 semaphore，等待后重新检查。单次预估超过 TPM 上限时拒绝。实际 usage 修正同一请求事件并保留原过期时间；真实用量超过预估不能撤销已发送请求。同名生成/judge 共享 provider 状态。CSV 解析时即限制每条原始记录（含表头）为 8 MiB、字段数为 65,536，并拒绝空或重复表头。延迟统计以每次返回的逻辑 provider 调用为样本，包含失败、重生成与 judge；内部重试和等待计入该样本，取消时丢弃的在途调用不计入。
 
 **English**: RPM/TPM are checked together before HTTP sends. When a budget is full, the semaphore permit is released and both budgets are rechecked after waiting. Estimates above the TPM cap are rejected. Actual usage corrects the same event without changing its expiry; excess actual usage cannot undo sent requests. Generation and judging with the same provider name share state. CSV parsing limits each raw record, including the header, to 8 MiB and 65,536 fields, rejecting empty or duplicate headers. Each returned logical provider call contributes a latency sample, including failures, regeneration, and judging. Internal retries and waits belong to that sample; in-flight calls dropped on cancellation are absent.
+
+**中文**：`output.commit_every` 默认 1，可改为 1–65536 的条数批次；正常结束提交尾批，取消或失败回滚未提交尾部。processed/accepted/rejected 统计描述本次尝试，`sink_state` 描述持久化进度。硬中断可能重做一个批次，模型调用也可能重复收费。源读取、去重、sink 写入、检查点与 Parquet 转换运行在有界专用 I/O 线程；指纹和恢复预检使用短期 blocking worker；转换按批次、摘要按读取块检查取消。开始最终链接事务后先完成事务，始终等 worker 退出后释放锁。
+
+**English**: `output.commit_every` defaults to 1 and accepts batches of 1–65536 records. Normal completion commits the tail; cancellation or failure rolls back the uncommitted tail. Processed/accepted/rejected counters describe this attempt; `sink_state` describes durable progress. A hard interruption may replay one batch and repeat paid model calls. Source reads, deduplication, sink writes, checkpoints, and Parquet conversion run in bounded dedicated I/O threads; fingerprinting and recovery preflight use short-lived blocking workers. Conversion checks cancellation per batch and hashing per read block. Once the final linking transaction starts, it finishes before returning; the lock is held until the worker exits.
+
+**中文**：去重默认使用内存索引和 64 MiB 记账预算（`dedup_max_bytes`），超限明确失败。`dedup_storage: disk` 支持精确与 MinHash 索引，使用 2 MiB SQLite 页缓存，索引占用随数据量增长的是磁盘空间。精确去重的 lowercase 只处理字符串值，保留对象键。MinHash 默认按单词切分；中文等无空格文本可选 `tokenization: characters` 与 `shingle_chars`（默认 3），按 Unicode 标量值去除空白后生成字符片段；两种模式均转小写。inspect 以固定长度摘要记录基数，共享 64 MiB 统计预算，超限列基数为 null；行缓冲默认 32 MiB、列数最多 4096。记账预算不等于 RSS 上限，Arrow 解码和临时记录另占内存。调整运行配置会改变配置 hash，不能直接续跑旧检查点。
+
+**English**: Dedup defaults to a memory index with a 64 MiB accounting budget (`dedup_max_bytes`) and fails explicitly on exhaustion. `dedup_storage: disk` supports exact and MinHash indexes with a 2 MiB SQLite page cache; index growth consumes disk space. Exact lowercase normalization changes string values while preserving object keys. MinHash defaults to word tokenization; Chinese and other unspaced text can use `tokenization: characters` and `shingle_chars` (default 3) to form shingles from Unicode scalar values after removing whitespace. Both modes lowercase text. Inspect retains fixed-size digests for cardinality under a shared 64 MiB statistics budget; capped columns report null cardinality. Row buffers default to 32 MiB and column count to 4096. Accounting budgets are not RSS limits: Arrow decoding and temporary records use additional memory. Configuration changes alter the configuration hash and require a new run rather than resuming the old checkpoint.
+
+**中文**：`provider_usage_by_name` 展示各 Provider 的 HTTP 统计，总量按名称去重合计。`returned_tokens_by_provider` 记录已消费逻辑调用返回的 token；费用用 `provider_pricing` 覆盖默认 `pricing`。HTTP 用量在检查状态码和 content 前记账，`content: null`、拒绝、截断或错误响应中有效的 usage 也会计入；费用优先使用这份实际响应累计值，自定义 provider 无此统计时回退到逻辑调用返回值。参与估算的 Provider 缺价格时总估算为 null。未返回的 usage 仍未知，取消不意味着远端未计费。
+
+**English**: `provider_usage_by_name` exposes HTTP statistics for each provider; totals count shared names once. `returned_tokens_by_provider` records tokens returned by consumed logical calls. `provider_pricing` overrides default `pricing`. HTTP usage is recorded before status and content checks, including valid usage on null content, refusals, truncation, and error responses. Cost prefers those physical-response totals, falling back to returned logical-call usage for custom providers without them. A missing price for a provider included in the estimate makes the total null. Usage that never arrives remains unknown; cancellation does not imply the server avoided billing.
+
+
+**中文**：HTTP provider 可配置 `max_completion_tokens`、`temperature`、`top_p`、`seed` 和 `response_format`（`json_object` / `text` / `json_schema`）。TPM 预留包含实际发送的 messages、修复反馈、响应 Schema，以及输出上限；未设置上限时使用 `estimated_completion_tokens`（默认 1024）。这是模型无关估计，服务端返回完整 usage 后会修正，不能把预留值当作实际账单。
+
+**English**: HTTP providers support `max_completion_tokens`, `temperature`, `top_p`, `seed`, and `response_format` (`json_object` / `text` / `json_schema`). TPM reservations include the actual messages, repair feedback, response schema, and output cap; without a cap, `estimated_completion_tokens` defaults to 1024. This is a model-independent estimate corrected when complete usage arrives, not an actual bill.
+
+**中文**：独立进度任务每 2 秒输出最新快照，每处理 500 条也输出一次。即使慢请求、I/O 或发布尚未完成，也会显示阶段、在途数、已处理数和已提交位置；快照不是实时写入计数，也不是 ETA。新运行先原子发布完整的 `initializing: true` 清单，再创建和同步空数据文件。只有该标记、零进度与空摘要同时成立时，恢复才允许补建缺失数据文件；未知的非空文件保持原样。旧清单缺少前缀摘要时仍可恢复，结构校验通过后在下一次提交补上摘要；旧摘要缺失前发生的内容修改无法事后检测。
+
+**English**: An independent progress task emits the latest snapshot every two seconds, with an additional update per 500 processed records. Slow requests, I/O, and publication still show the phase, in-flight work, processed count, and committed position; the snapshot is neither a live write counter nor an ETA. New runs atomically publish a complete `initializing: true` manifest before creating and syncing empty data files. Resume may recreate missing data files only with that marker, zero progress, and empty digests; unknown nonempty files remain untouched. Legacy manifests without prefix digests can still resume after structural checks, and the next commit adds digests. Changes made before those digests existed cannot be detected retroactively.
 
 **下一步 / Next**：完成 [实验手册](LABS.md)，再用 [术语与检查题](GLOSSARY.md) 自测。 / Complete the [labs](LABS.md), then use the [glossary and review questions](GLOSSARY.md) to assess your understanding.

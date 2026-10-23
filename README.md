@@ -1,6 +1,6 @@
 # SynthFlow
 
-Rust 本地优先的合成数据流水线引擎。已实现设计文档的 Phase 0–13:DSL、JSONL/CSV/inline 源、mock 与 OpenAI-compatible HTTP provider、结构化输出重生成、RPM/TPM 限流、judge 评判、精确与 MinHash 去重、JSONL/Parquet 输出、checkpoint resume、指标与 inspect。
+Rust 本地优先的合成数据流水线引擎。当前实现：DSL、JSONL/CSV/inline 源、mock 与 OpenAI-compatible HTTP provider、结构化输出重生成、RPM/TPM 限流、judge 评判、精确与 MinHash 去重、JSONL/Parquet 输出、checkpoint resume、指标与 inspect。原设计是历史蓝图；Phase 13 的基础统计已实现，DataFusion SQL 尚未实现。
 
 ```text
 JSONL / CSV / Inline → Prompt → Mock / OpenAI-compatible HTTP → JSON Parse
@@ -12,8 +12,8 @@ JSONL / CSV / Inline → Prompt → Mock / OpenAI-compatible HTTP → JSON Parse
 这是一个可用于学习 Rust 流式处理、异步并发和可靠性设计的教学项目。
 This project is a teaching case for Rust streaming, async concurrency, and reliability.
 
-请从 [中英文双语教学入口 / Bilingual teaching index](docs/README.md) 开始：包含 10 章源码导读、8 个实验、术语表和教师指南（撰写于 Phase 0–3；新阶段的教学章节待补充）。
-Start with the bilingual teaching index for a ten-chapter walkthrough, eight labs, a glossary, and instructor notes (written for Phases 0–3; chapters for the newer phases are pending).
+请从 [中英文双语教学入口 / Bilingual teaching index](docs/README.md) 开始：包含 11 章源码导读、9 个实验、术语表和教师指南，覆盖当前实现。
+Start with the bilingual teaching index for an eleven-chapter walkthrough, nine labs, a glossary, and instructor notes covering the current implementation.
 
 ## 快速开始
 
@@ -43,7 +43,7 @@ cargo install --path crates/synthflow-cli --locked
 synthflow run examples/simple_generation.yaml
 ```
 
-运行报告以 JSON 写入 stdout，日志写入 stderr；设置 `RUST_LOG=warn` 可以减少日志。运行中每 500 条记录或每 2 秒输出一次 progress 事件。`validate` 和 `plan` 成功时输出可读文本。
+运行报告以 JSON 写入 stdout，日志写入 stderr；设置 `RUST_LOG=warn` 可以减少日志。运行中每 500 条记录或由独立定时器每 2 秒输出一次 progress 事件，等待模型、限流或磁盘操作时也会继续报告。`validate` 和 `plan` 成功时输出可读文本。
 
 **已有正式文件不会被覆盖。** 输出、partial、manifest、dead-letter 任意一个已存在都会阻止新的 `run`。失败的运行用 `synthflow resume <pipeline>` 从已提交前缀续跑（见下文）；需要全新开始时请更换 `output.path`（自定义 dead-letter 也要一并更换），需要清理时自行归档/删除对应的整组文件。
 
@@ -58,13 +58,13 @@ synthflow run examples/simple_generation.yaml
 | `data.jsonl.rejected.jsonl` | 被拒绝记录的 ID、位置、错误类别、字段路径和尝试次数 |
 | `data.jsonl.manifest.json` | run ID、状态、源指纹、配置 hash、时间、统计和提交位置；resume 的 checkpoint |
 
-每条已处理记录按源顺序写入，随后同步 accepted/dead-letter 文件，再原子替换并同步 manifest。`sink_state` 包含已提交的源位置、JSONL/CSV 的 `source_byte_offset`、accepted/rejected 字节数和记录数。这些字段表示持久化前缀；顶层统计表示处理情况，遇到磁盘错误时不应将它们直接当作已持久化的行数。
+默认每条已处理记录按源顺序写入，随后同步 accepted/dead-letter 文件，再原子替换并同步 manifest。`sink_state` 包含已提交的源位置、JSONL/CSV 的 `source_byte_offset`、accepted/rejected 字节数、记录数和已提交前缀的 BLAKE3 摘要。这些字段表示持久化前缀；顶层统计表示处理情况，遇到磁盘错误时不应将它们直接当作已持久化的行数。
 
-成功发布使用同目录硬链接：只会创建不存在的最终路径，不会覆盖并发创建的文件。Parquet 运行先在同目录唯一的 `.synthflow-publish-*` 临时文件中完成转换，再记录最终文件的 `publication_digest` 并链接发布。当前面向支持硬链接和目录同步的本地文件系统（macOS/Linux）。完成后清理 partial 与临时文件；清理失败不影响完整输出。SIGKILL 可能留下孤立转换文件，恢复会使用新的临时文件，不覆盖未知文件。每条记录同步的策略优先保证正确性，可配置提交批次留待后续。
+成功发布使用同目录硬链接：只会创建不存在的最终路径，不会覆盖并发创建的文件。Parquet 运行先在同目录唯一的 `.synthflow-publish-*` 临时文件中完成转换，再记录最终文件的 `publication_digest` 并链接发布。当前面向支持硬链接和目录同步的本地文件系统（macOS/Linux）。完成后清理 partial 与临时文件；清理失败不影响完整输出。SIGKILL 可能留下孤立转换文件，恢复会使用新的临时文件，不覆盖未知文件。默认每条同步；需要减少提交开销时可设置 `output.commit_every`，并接受更大的未提交窗口。
 
 状态为 `running`、`publishing`、`completed`、`failed`、`cancelled`。数据文件和 manifest 不是跨文件事务：如果在发布窗口中被强制终止，可能同时存在完整数据和 `publishing` 清单。消费者应以 **正式文件存在且 manifest 为 completed** 为完成条件。
 
-Ctrl+C 取消在途请求、保留已提交前缀并记录 `cancelled`，退出码为 130；第二次 Ctrl+C 强制退出。SIGKILL 无法执行清理，清单可能仍为 `running`；突然终止后 partial 尾部可能超出清单记录的提交字节数。
+Ctrl+C 取消在途请求、保留已提交前缀并记录 `cancelled`，退出码为 130；Unix 的 SIGTERM 使用相同收尾流程，退出码为 143。第二次终止信号强制退出。SIGKILL 无法执行清理，清单可能仍为 `running`；突然终止后 partial 尾部可能超出清单记录的提交字节数。
 
 ### Resume
 
@@ -76,8 +76,9 @@ synthflow resume examples/simple_generation.yaml
 
 - 校验配置 hash、源指纹和产物路径。活跃进程持有锁时拒绝恢复；SIGKILL 释放锁后允许接管 `running` 清单。`completed` 清单不重复执行。
 - 输出路径对应的 `.lock` 文件提供跨进程独占锁，防止多个 run/resume 同时修改同一检查点。
-- partial 与 dead-letter 截断到 manifest 记录的提交字节前缀后追加写入；崩溃遗留的尾部被丢弃。
-- 已接受前缀逐行校验并重建 dedup 状态，不再将整个前缀装入内存；索引本身仍随唯一记录数增长。Parquet 从首条已接受记录重建原 Schema。
+- 先校验 partial 与 dead-letter 两个已提交前缀的内容摘要、行数和边界，通过后才截断并追加。损坏任一前缀都拒绝恢复；崩溃遗留的未提交尾部被丢弃。旧清单缺少摘要时仍验证长度/JSON/行数，无法追溯检测旧的同长度改写。
+- 初始化先原子发布完整的 `initializing` 清单，再创建空数据文件；中断后仅凭该零进度意图补建缺失的空文件，不覆盖未知内容。
+- 已接受前缀逐行重建 dedup 状态；memory 索引随唯一记录数增长，disk 索引重建到临时 SQLite。Parquet 使用显式 `output.schema` 或首条已接受记录重建固定 Schema，并逐行复核已提交前缀的类型与无损转换。即使摘要匹配，旧版曾接受的有损数值记录也会在修改文件前拒绝恢复；原产物保持原样，需要新输出路径重新运行。
 - 新 JSONL/CSV 检查点按源字节偏移定位，旧检查点仍兼容扫描跳过；源身份校验仍需扫描文件计算指纹。按序提交避免重复输出已提交的源位置。
 - `publishing` 清单若已有最终文件，仅当文件内容匹配发布前保存的 digest 才确认完成；不匹配或旧清单缺少 digest 时拒绝自动接管。没有最终文件时从 JSONL 检查点重试。
 - 新 manifest 记录 `resumed_from`（前次 run ID 与已提交数量）；strict/最大拒绝数不能通过恢复绕过；拒绝比例在全数据处理完后计算，取消时的暂时高比例不阻止继续。正常续跑统计只包含新增记录；确认已发布文件时保留原报告。
@@ -100,6 +101,11 @@ providers:
     # api_key_env: LOCAL_LLM_API_KEY
     concurrency: 4
     timeout_ms: 60000
+    max_completion_tokens: 2048
+    temperature: 0.7
+    top_p: 0.95
+    seed: 42
+    response_format: {type: json_object}
     retry:
       max_attempts: 5
       initial_delay_ms: 500
@@ -109,7 +115,7 @@ providers:
       tokens_per_minute: 200000
 ```
 
-请求发往 `${base_url}/chat/completions`，发送 user message 和 `response_format: {type: json_object}`。不跟随 HTTP 重定向。服务器需要兼容此结构。
+请求发往 `${base_url}/chat/completions`，发送 user message。`response_format` 默认 `{type: json_object}`，也支持 `{type: text}` 与 `{type: json_schema, json_schema: {name: answer, strict: true, schema: {...}}}`。text 模式下本地流水线仍要求 JSON 对象和 Schema 校验。长度、采样及 seed 参数仅在配置后发送，具体支持由服务端模型决定；seed 不保证模型确定性。不跟随 HTTP 重定向。
 
 每个 provider 有独立 semaphore；执行器最多持有 `concurrency` 条在途记录，包括等待按序提交的结果。慢记录会对上游施加背压。重试使用有上限的指数退避和随机抖动，不在退避期间占用 semaphore。
 
@@ -118,8 +124,8 @@ providers:
 - `timeout_ms` 覆盖每次 HTTP 请求和响应体读取；等待并发许可与重试退避不计入单次超时。
 - `Retry-After` 支持秒数和 HTTP 日期；当前等待上限仍由 `max_delay_ms` 限制。
 - `max_attempts` 包含首次请求；配置范围为 1–100，并发范围为 1–1024。
-- `rate_limit` 是 60 秒滑动窗口：在每次 HTTP 发送前联合检查 RPM/TPM，包含重试。预算不足时释放 semaphore、等待后重新检查。单次预估 token 超过 TPM 上限会拒绝；真实 usage 修正原请求事件，沿用原过期时间，不产生额外负数额度。TPM 是估算准入，实际 usage 超过预估时无法撤销已发送请求，会约束后续发送。同一配置名用于生成与 judge 时共享 provider、并发与限流状态。
-- `provider_usage` 记录实际请求数、重试数、已返回的 prompt/completion tokens 和已完成 HTTP 尝试的累计耗时。取消请求可能已产生服务端费用，但未返回 usage，不能据此推断实际账单。
+- `rate_limit` 是 60 秒滑动窗口：在每次 HTTP 发送前联合检查 RPM/TPM，包含重试。预算不足时释放 semaphore、等待后重新检查。准入采用实际 messages（含修复反馈）和响应格式的 UTF-8 字节保守估计，加上 `max_completion_tokens` 输出预留；未设置上限时使用 `estimated_completion_tokens`（默认 1024，仅估算，不发送）。单次预估 token 超过 TPM 上限会拒绝；真实 usage 修正原请求事件，沿用原过期时间，不产生额外负数额度。TPM 是估算准入，实际 usage 超过预估时无法撤销已发送请求，会约束后续发送。同一配置名用于生成与 judge 时共享 provider、并发与限流状态。
+- `provider_usage` 记录实际请求数、重试数、已返回的 prompt/completion tokens、`usage_reports` 和已完成 HTTP 尝试的累计耗时。先记 usage 再验证 HTTP 状态和内容，拒答、截断、非法 content 或重试响应已返回的用量也会保留。`provider_refusal` 与 `provider_truncated` 提供单独诊断。取消请求可能已产生服务端费用，但未返回 usage，不能据此推断实际账单。
 
 Mock 使用 `type: mock` 和 `response` 模板，可选 `concurrency`，默认 1。上下文为 `record`、渲染后的 `prompt`、`prompt_hash`、`feedback`（重生成时的修复说明）和 `generated`（作为 judge 时的被评对象）；将字符串插入 JSON 时使用 `tojson`。mock 的生成内容和记录 ID 保持确定性，每次独立执行的 run ID 不同。
 
@@ -167,7 +173,21 @@ dedup:
   shingle_words: 3     # 1–10
 ```
 
-exact 用规范化 JSON 的 BLAKE3 作为键；minhash 用词 n-gram shingle、128 维（可配）签名和 LSH 分带候选查找，以签名相同分量比例估计 Jaccard 相似度。重复记录以 `duplicate` 类别拒绝；配置的字段缺失记 `dedup_field`。去重按提交顺序在 judge 之后执行，state 可在 resume 时从已提交前缀重建。
+exact 用规范化 JSON 的 BLAKE3 作为键；`lowercase` 仅转换字符串值，保留对象字段名，避免 `A`/`a` 冲突丢失信息。minhash 统一对所有长度文本转小写、折叠 Unicode 空白后，用词 n-gram shingle、128 维（可配）签名和 LSH 分带候选查找，以签名相同分量比例估计 Jaccard 相似度。重复记录以 `duplicate` 类别拒绝；配置的字段缺失记 `dedup_field`。去重按提交顺序在 judge 之后执行，state 可在 resume 时从已提交前缀重建。
+
+中文近重复与磁盘索引示例：
+
+```yaml
+dedup_storage: disk  # 默认 memory；exact 与 minhash 均支持 disk
+dedup:
+  method: minhash
+  field: generated.answer
+  tokenization: characters  # 默认 words
+  shingle_chars: 3          # 1–32，Unicode 字符窗口；去空白并转小写
+  threshold: 0.6
+```
+
+disk 使用可重建的临时 SQLite 索引，页缓存目标 2 MiB，逐条读取候选；需要临时磁盘空间。正常退出清理临时库，SIGKILL 可能留下临时文件。`dedup_max_bytes` 只约束 memory 索引。旧版本 lowercase 误拒绝的记录需要重新生成才能补回。
 
 ### 失败策略
 
@@ -196,15 +216,35 @@ errors:
 - 生成模板支持 `{{ record.topic }}` 和 `{{ topic }}`，`record` 始终表示完整输入。变量缺失导致拒绝；模板不提供环境变量、shell 或文件系统入口。
 - 输出必须是纯 JSON 对象。Schema 支持嵌套对象、数组、基本类型、required、properties、enum 等。真正的 Schema 引用暂不支持；普通属性名或枚举数据中的 `$ref` 不会被误判。
 - 输出保留原始字段，追加 `generated`（启用 judge 时还有 `judge`）和 `_meta`；元数据包含记录 ID、run ID、源位置和指纹、配置 hash、DSL 版本、provider/model、prompt hash、attempt、模板引擎版本以及 judge 信息。
-- Parquet 输出以首条已接受记录推断 Arrow schema；后续记录出现 schema 之外的字段或类型冲突按记录拒绝（`sink_row`），不会静默丢列。发布前 partial 始终是逐条同步的 JSONL。
+- Parquet 支持显式 `output.schema`（对象、数组、可选/可空字段、int64/uint64/number）；`_meta` 自动添加。未配置时从首条通过检查的记录推断。Schema 在运行和发布时保持固定，不再全量重新推断；拒绝未知字段、整数截断和有损浮点转换。详见 [输出契约](docs/PARQUET_SCHEMA.md) 和 [显式 Schema 示例](examples/parquet_explicit_schema.yaml)。发布前 partial 始终是 JSONL，按 `output.commit_every` 同步。
 - YAML、JSONL 单行、模板输出及 HTTP 响应体各限制为 8 MiB，模板有 100,000 fuel 上限。inline 输入随 YAML 一次载入；JSONL/CSV 流式读取。模板中间值和 Schema 运算仍不是通用不可信代码的资源沙箱。
+
+### 提交批次与去重预算
+
+```yaml
+output:
+  format: jsonl
+  path: output/data.jsonl
+  commit_every: 128  # 默认 1；范围 1–65536，与 Parquet batch_size 独立
+# 顶层配置；默认 64 MiB 的索引记账预算
+dedup_max_bytes: 67108864
+```
+
+正常完成会同步最后一个不足批次的尾部。失败或取消丢弃未提交尾部，恢复从 manifest 的位置重做；硬中断最多需要重做当前批次的 `commit_every` 条已处理记录，另有并发在途请求可能已产生费用。报告的 processed/accepted/rejected 是本次尝试计数，持久化进度以 `sink_state` 为准。memory 去重预算超限使运行失败，保留已提交检查点，不会静默漏去重。预算采用键、签名和哈希表开销的保守记账单位，并非严格 RSS 上限；去重临时计算、Arrow 与记录缓冲另占内存。调整提交间隔、去重后端或预算会改变配置 hash，需新输出路径重新运行；大规模任务应在开始前选择 disk 后端。
 
 ### 指标与成本
 
 - `latency_calls_total` 记录已消费记录中返回的 provider 调用数量，包含失败调用、重生成和 judge。`latency.mean_ms / p50_ms / p95_ms / p99_ms` 按每次逻辑调用统计，包含其内部 HTTP 重试、等待和退避；取消时丢弃的在途调用不计入。均值增量计算；分位数使用最多 4096 个蓄水池样本，超过该数量时为近似值。
-- `prompt_tokens_total` / `completion_tokens_total` 为引擎视角的全部 provider 调用（含 judge）返回的 usage 之和；mock 不返回 usage。
-- 可选 `pricing: {input_usd_per_mtok: 10.0, output_usd_per_mtok: 20.0}` 将其换算为 `estimated_cost_usd`（估算值，未含被取消请求的服务端费用）。
-- 运行期间每 500 条或 2 秒记录一次 progress 日志事件（processed/accepted/rejected/rate）。
+- `prompt_tokens_total` / `completion_tokens_total` 是已消费记录中成功返回内容的逻辑 provider 调用（含 judge）usage 之和；mock 不返回 usage。它们与包含失败 HTTP 响应的 `provider_usage` 口径不同。
+- `provider_usage_by_name` 按配置名记录 HTTP 请求/重试/usage，`provider_usage` 为去除共享实例重复计数后的总量；`returned_tokens_by_provider` 按名称记录已消费记录的逻辑调用返回 token。
+- `pricing` 是默认价格，`provider_pricing` 按名称覆盖，单位为美元/百万 token。计费优先使用 HTTP provider 已记录的全部 usage（含失败、重试和取消前已返回的响应）；自定义 provider 没有 HTTP usage 统计时回退到逻辑调用用量。有用量的 provider 缺价格时总费用为空，避免把部分费用当总费用。缺失 usage 的服务端费用仍不可知。
+
+```yaml
+pricing: {input_usd_per_mtok: 10.0, output_usd_per_mtok: 20.0}
+provider_pricing:
+  reviewer: {input_usd_per_mtok: 1.0, output_usd_per_mtok: 2.0}
+```
+- 独立 progress 心跳每 2 秒报告 processed/accepted/rejected/rate、已提交位置 committed、在途数量 in_flight 和 phase；每处理 500 条也报告一次。
 
 ### Inspect
 
@@ -213,7 +253,9 @@ synthflow inspect output/data.jsonl          # 可读表格
 synthflow inspect output/data.parquet --json # 完整 JSON 摘要
 ```
 
-统计行数、字节数和每个顶层列的类型、非空/空值计数（缺失键计为空值）、数值列的 min/max/mean 以及上限一百万的去重基数。混合类型列只用数值项计算 min/max/mean；没有数值项时均值为 null。SQL 查询（DataFusion）暂未实现。
+统计行数、字节数和每个顶层列的类型、非空/空值计数（缺失键计为空值）、数值列的 min/max/mean 以及上限一百万的去重基数。混合类型列只用数值项计算 min/max/mean；没有数值项时均值为 null。min/max 保留整数原始精度，mean 使用防溢出的增量浮点算法（仍为近似浮点统计）。SQL 查询（DataFusion）暂未实现。
+
+JSONL 行与 Parquet 行的序列化缓冲默认限制为 32 MiB；顶层列最多 4096，统计状态预算为 64 MiB。基数使用 BLAKE3 固定长度摘要，达到单列数量上限或共享预算时该列 `distinct` 返回 null，其他统计继续。摘要碰撞概率极低，但不提供数学上的精确性保证。JSONL 库调用可通过 `InspectLimits` 调整限制；Parquet 的 Arrow 解码内存不属于统计预算。
 
 ## 库与架构
 
@@ -224,7 +266,7 @@ synthflow inspect output/data.parquet --json # 完整 JSON 摘要
 - 同步兼容入口：`run(&pipeline)`；失败时返回错误。需要完整失败报告的调用者使用异步入口或读取 manifest。
 - `Ok(report)` 只表示已经返回运行报告；调用者必须检查 `report.succeeded()`，不能把 `Ok` 等同于任务成功。
 
-当前文件读取、写入和每条记录的同步操作仍在执行任务中同步进行；指纹扫描使用 blocking worker。HTTP 调用与等待是异步的。后续可将源和 sink 移到有界 blocking worker，以改善慢磁盘下的调度响应。
+源读取和 sink/去重各使用一个专用后台线程，容量为 1 的邮箱限制排队操作；文件读取、写入、同步、SQLite 和 Parquet 发布不占异步执行线程。空闲 worker 不占 Tokio 共享阻塞线程池。输出 worker 持有文件锁直至排队写入退出，取消不会在同步事务中途释放锁。指纹和恢复扫描使用 blocking 任务并逐块检查取消；HTTP 调用与等待保持异步。操作系统正在执行的文件系统调用不能被抢占，完整进程 RSS 也不受单个索引预算严格限制。
 
 ## 验证与后续
 
@@ -232,8 +274,15 @@ synthflow inspect output/data.parquet --json # 完整 JSON 摘要
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
+python3 scripts/check_labs.py
+cargo package --workspace --locked --allow-dirty
+python3 scripts/check_install.py
+cargo build --release --workspace --locked
+python3 scripts/benchmark.py --records 1000
 ```
 
-测试只使用临时文件及回环地址上的 HTTP server，覆盖重试/超时/鉴权/限流、拒绝策略、重生成、judge、精确与 MinHash 去重、CSV、Parquet schema 拒绝、resume 不重复输出、输出防覆盖、Schema 诊断、源变化、写入错误、取消和进程强制终止；Unix 上额外验证 SIGINT。
+测试只使用临时文件及回环地址上的 HTTP server，覆盖重试/超时/鉴权/限流、拒绝策略、重生成、judge、精确与 MinHash 去重、CSV、Parquet schema 拒绝、resume 不重复输出、输出防覆盖、Schema 诊断、源变化、写入错误、取消和进程强制终止；Unix 上额外验证 SIGINT、SIGTERM 和慢请求期间的进度心跳。
 
-[IMPLEMENTATION.md](IMPLEMENTATION.md) 记录阶段交付。尚未实现：DataFusion SQL 查询、inspect 之外的分布式架构（设计文档第 47 节之后）、有界 blocking worker 的文件 I/O、可配置的提交批次与 throughput 优化。
+[IMPLEMENTATION.md](IMPLEMENTATION.md) 记录阶段交付。尚未实现：DataFusion SQL 查询、分布式执行、跨运行增量数据集管理。当前支持范围与历史蓝图的差异见 [能力状态](docs/STATUS.md)。
+
+性能脚本提供多规模、多后端、Parquet/judge/并发矩阵、重复测量与可选 SIGKILL 恢复，记录环境、二进制指纹、吞吐和峰值 RSS，见 [性能说明](docs/PERFORMANCE.md)。CI 覆盖 Linux/macOS × stable/Rust 1.93，stable 还执行教材、crate 打包与隔离安装冒烟。tag 或手动触发可构建带 SHA-256 校验的二进制包；详情见 [发布流程](docs/RELEASING.md)。

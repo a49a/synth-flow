@@ -21,7 +21,7 @@
 | 重新生成 | Regeneration | Schema 拒绝后将修复反馈交给 provider 再生成 / Calling the provider again with repair feedback after schema rejection |
 | 评判 | Judge | 第二次 provider 调用给生成内容评分并筛选 / A second provider call that scores and filters generated content |
 | 去重 | Deduplication | 在 sink 接受后登记精确或 MinHash 键 / Registering exact or MinHash keys after sink acceptance |
-| 恢复 | Resume | 校验中断清单、源与配置后，从已提交前缀继续 / Continuing an interrupted run from its committed prefix after source/config checks |
+| 恢复 | Resume | 校验源、配置及 accepted/rejected 前缀摘要后继续 / Continuing after source, configuration, and accepted/rejected prefix digest checks |
 | 指数退避 | Exponential backoff | 重试间隔随尝试次数增加，带上限 / Increasing retry intervals with a cap |
 | 抖动 | Jitter | 随机化等待时间以分散重试 / Randomized delay to spread retries |
 | 取消令牌 | Cancellation token | 共享取消信号 / Shared cancellation signal |
@@ -96,15 +96,15 @@
 
 ### 8. 已保存偏移，resume 还需要检查什么？ / What must resume check beyond saved offsets?
 
-**中文**：当前 `resume` 校验配置 hash 和源指纹，截断未提交尾部，恢复计数、去重状态及 Parquet Schema；输出命名空间使用跨进程锁，避免并发恢复。锁释放后可以恢复 SIGKILL 留下的 running 状态；publishing 已有最终文件时必须匹配发布摘要。新检查点保存源字节偏移；重建去重状态逐行进行，索引本身仍随数据量增长。
+**中文**：当前 `resume` 校验配置 hash、源指纹，以及 accepted/rejected 两个已提交前缀的摘要、长度和行数，再截断未提交尾部，恢复计数、去重状态及 Parquet Schema；输出命名空间使用跨进程锁，避免并发恢复。锁释放后可以恢复 SIGKILL 留下的 running 状态；publishing 已有最终文件时必须匹配发布摘要。新检查点保存源字节偏移；重建去重状态逐行进行；默认内存索引受预算限制，磁盘索引使用有界页缓存。旧清单无前缀摘要时保留结构校验，下一次提交补充摘要。
 
-**English**: Current `resume` checks the configuration hash and source fingerprint, truncates uncommitted tails, and restores counters, deduplication state, and the Parquet schema. A cross-process namespace lock prevents concurrent resume. After the lock is released, running states left by SIGKILL can be resumed. A publishing state with final output requires a matching publication digest. New checkpoints store source byte offsets; dedup state is rebuilt row by row, while the index itself still grows with data size.
+**English**: Current `resume` checks the configuration hash, source fingerprint, and the digests, lengths, and row counts of both committed prefixes before truncating uncommitted tails, and restores counters, deduplication state, and the Parquet schema. A cross-process namespace lock prevents concurrent resume. After the lock is released, running states left by SIGKILL can be resumed. A publishing state with final output requires a matching publication digest. New checkpoints store source byte offsets; dedup state is rebuilt row by row, with a budgeted memory index or a disk index with a bounded page cache. Legacy manifests lacking prefix digests retain structural checks, and the next commit adds digests.
 
 ## 常见误区 / Common misconceptions
 
 | 误区 / Misconception | 更准确的说法 / More accurate statement |
 | --- | --- |
-| async 就不阻塞 / Async means nonblocking everywhere | 同步文件 I/O 和 sync_all 仍可阻塞任务线程 / Synchronous file I/O and sync_all can still block the task thread |
+| async 就不阻塞 / Async means nonblocking everywhere | 文件系统调用仍阻塞；当前用有界专用 I/O 线程避免阻塞 Tokio 调度线程 / Filesystem calls still block; bounded dedicated I/O threads keep them off Tokio async workers |
 | Schema 合格就是答案正确 / Schema-valid means factually correct | 结构契约与语义质量是不同问题 / Structural contracts and semantic quality are separate |
 | 400/401 不重试意味着整个任务立即退出 / No retry on 400/401 means immediate run exit | 当前先拒绝该记录，再由失败策略决定是否停止 / The record is rejected; failure policy decides whether the run stops |
 | running 清单表示进程活着 / A running manifest proves a live process | 它只是最后持久化的状态 / It is only the last persisted state |
@@ -124,3 +124,21 @@
 **中文**：不要因学生只得到“测试通过”而给满分。要求其解释测试为什么能发现目标错误，以及它没有覆盖的情况。教材中的实验使用测试夹具而非真实模型，是为了隔离引擎行为，不是证明模型效果。
 
 **English**: Passing tests alone should not earn full credit. Ask students why a test can detect the target fault and what it does not cover. The labs use fixtures rather than real models to isolate engine behavior, not to demonstrate model quality.
+
+## 新增边界术语 / Additional boundary terms
+
+| 中文 | English | 定义 / Definition |
+| --- | --- | --- |
+| 记账预算 | Accounting budget | 按保守单位限制索引增长，不等于进程 RSS 限额 / Limits index growth using conservative units, not a process RSS limit |
+| 未提交尾部 | Uncommitted tail | 已处理但不在持久化检查点内的记录，恢复时重做 / Processed records outside the durable checkpoint, replayed on recovery |
+| 分 Provider 费用 | Per-provider cost | HTTP 优先按有效响应 usage 汇总，含错误响应；自定义 provider 回退到逻辑返回值，缺价格总计为 null / Prefer valid HTTP response usage including errors, fall back to logical-call usage for custom providers, and return null totals when prices are missing |
+| 前缀摘要 | Prefix digest | 增量记录已提交 JSONL 字节的 BLAKE3，恢复前校验两个文件 / Incremental BLAKE3 over committed JSONL bytes, verified for both files before resume |
+| 初始化意图 | Initialization intent | 原子完整清单的 initializing 标记，仅允许恢复零进度的缺失空文件 / An initializing marker in an atomic complete manifest, allowing only missing empty files at zero progress to be recreated |
+| 显式输出 Schema | Explicit output schema | output.schema 固定 Parquet 字段类型及可空性，自动合并 _meta / output.schema fixes Parquet field types and nullability, adding _meta automatically |
+| 字符片段 | Character shingle | 对去空白、转小写后的 Unicode 标量值取连续片段，适用于无空格文本 / Contiguous Unicode scalar values after whitespace removal and lowercasing, suitable for unspaced text |
+| 磁盘去重索引 | Disk dedup index | 临时 SQLite 索引；页缓存有界，恢复时由已接受记录重建 / Temporary SQLite index with a bounded page cache, rebuilt from accepted records on resume |
+| 进度心跳 | Progress heartbeat | 独立每 2 秒记录最新阶段与计数，不依赖一条记录完成 / Latest phase and counts emitted independently every two seconds without waiting for a record to finish |
+
+**中文**：教学时可比较三个不同边界：首个 Ctrl+C / Unix SIGTERM 会触发取消并保留检查点；再次发送终止信号会立即退出；SIGKILL 无法写入最终状态。相应退出码为 130 / 143，恢复依赖持久化清单与数据前缀，而非最后一条日志。
+
+**English**: Compare three boundaries in class: the first Ctrl+C / Unix SIGTERM requests cancellation and preserves a checkpoint; a second termination signal exits immediately; SIGKILL cannot write final status. The corresponding handled signal exit codes are 130 / 143. Recovery depends on the durable manifest and data prefixes, not the final log message.

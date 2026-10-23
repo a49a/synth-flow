@@ -11,6 +11,8 @@
 | [概念与源码导读 / Concepts and code walkthrough](TEACHING_GUIDE.md) | 数据流、Rust 边界、校验、恢复、去重与测试 / Data flow, Rust boundaries, validation, resume, deduplication, and testing |
 | [实验手册 / Lab workbook](LABS.md) | 9 个实验，含预期结果与参考解释 / Nine labs with expected results and explanations |
 | [术语与教师指南 / Glossary and instructor notes](GLOSSARY.md) | 中英术语、课堂安排、检查题与评分标准 / Bilingual terminology, lesson plans, review questions, and assessment |
+| [Parquet 输出契约 / Parquet output contracts](PARQUET_SCHEMA.md) | 显式类型、空值、可选字段与检查点完整性 / Explicit types, nulls, optional fields, and checkpoint integrity |
+| [性能测量 / Performance measurements](PERFORMANCE.md) | 可复现的吞吐、RSS 与恢复测试 / Reproducible throughput, RSS, and recovery checks |
 | [项目使用说明 / Project usage](../README.md) | 当前 CLI、配置及限制 / Current CLI, configuration, and limitations |
 | [设计目标 / Design goals](../SYNTHFLOW_DESIGN.md) | 长期蓝图，包含尚未实现的功能 / Long-term blueprint, including unimplemented features |
 
@@ -39,6 +41,22 @@
 
 ## 文档与实现的边界 / Documentation versus implementation
 
-**中文**：教材以当前仓库代码为准。已实现 JSONL/CSV/inline 输入、mock/HTTP provider、Schema 校验与重生成、judge、精确/MinHash 去重、JSONL/Parquet 输出、RPM/TPM 限流、显式 `resume`、指标和 `inspect`。`resume` 在独占锁下支持 failed/cancelled/running/publishing；已发布文件需要内容摘要验证，旧版缺少摘要或发生冲突时仍需人工检查。设计文档还包含未实现的长期目标。
+**中文**：教材以当前仓库代码为准。已实现 JSONL/CSV/inline 输入、mock/HTTP provider、Schema 校验与重生成、judge、精确/MinHash 去重、JSONL/Parquet 输出、RPM/TPM 限流、显式 `resume`、指标和 `inspect`。`resume` 在独占锁下支持 failed/cancelled/running/publishing；已发布文件需要内容摘要验证，旧版缺少发布摘要或发生冲突时仍需人工检查。设计文档还包含未实现的长期目标。
 
-**English**: These materials describe the current repository. It implements JSONL/CSV/inline sources, mock/HTTP providers, schema validation and regeneration, judging, exact/MinHash deduplication, JSONL/Parquet output, RPM/TPM limiting, explicit `resume`, metrics, and `inspect`. Under an exclusive lock, resume accepts failed/cancelled/running/publishing manifests. Existing final output requires digest verification; legacy manifests without a digest and conflicting files still need manual inspection. The design document also contains longer-term goals.
+**English**: These materials describe the current repository. It implements JSONL/CSV/inline sources, mock/HTTP providers, schema validation and regeneration, judging, exact/MinHash deduplication, JSONL/Parquet output, RPM/TPM limiting, explicit `resume`, metrics, and `inspect`. Under an exclusive lock, resume accepts failed/cancelled/running/publishing manifests. Existing final output requires digest verification; legacy manifests without a publication digest and conflicting files still need manual inspection. The design document also contains longer-term goals.
+
+## 自动验证与性能 / Automated validation and performance
+
+运行 `python3 scripts/check_labs.py` 会执行实验手册中的原始 Bash 代码块及 Python 断言，并检查命名测试确实执行了一个测试；最终全量检查由 CI 单独执行。Linux/macOS × stable/Rust 1.93 的 CI 验证构建、Clippy 和测试。性能测量方法见 [性能说明](PERFORMANCE.md)。
+
+Run `python3 scripts/check_labs.py` to execute the workbook's original Bash blocks and Python assertions, including verification that each named test actually runs one test. CI runs the final workspace checks separately. Linux/macOS × stable/Rust 1.93 CI validates builds, Clippy, and tests. See [performance notes](PERFORMANCE.md) for measurements.
+
+## 当前实现补充 / Current implementation additions
+
+**中文**：源与存储操作通过有界专用 I/O 线程执行。精确与 MinHash 去重均可选择 `dedup_storage: disk`；中文近重复比较可选字符片段。HTTP 请求支持输出长度、采样和响应模式，错误响应返回的有效 usage 也计入统计与费用。进度每 2 秒独立更新，Unix SIGTERM 与 Ctrl+C 均可保存可恢复进度。
+
+**English**: Source and storage operations use bounded dedicated I/O threads. Exact and MinHash deduplication can select `dedup_storage: disk`, while character shingles support near-duplicate comparison of unspaced Chinese text. HTTP requests expose output length, sampling, and response modes; valid usage on error responses contributes to usage and cost. Progress updates independently every two seconds, and both Unix SIGTERM and Ctrl+C preserve resumable progress.
+
+**中文**：`output.schema` 为 Parquet 固定输出类型，自动补充 `_meta`；未配置时按首条接受记录推断，拒绝有损数值转换。检查点对 accepted/rejected 前缀分别维护增量摘要，恢复时先校验再修改文件。缺少前缀摘要的旧清单仍支持结构校验与恢复；这与已有最终输出必须匹配发布摘要是两种检查。完整的原子初始化清单允许安全补建尚未创建的空文件，不会删除未知数据。配置示例见 [显式 Parquet 示例](../examples/parquet_explicit_schema.yaml)。
+
+**English**: `output.schema` fixes Parquet output types and adds `_meta` automatically. Without it, the first accepted row determines the schema; lossy numeric conversions are rejected. Checkpoints maintain incremental digests for accepted/rejected prefixes, verifying both before any resume mutation. Legacy manifests lacking prefix digests remain structurally verifiable and resumable; this is separate from requiring a publication digest for an existing final output. A complete atomic initialization manifest allows missing empty data files to be created safely without removing unknown content. See the [explicit Parquet example](../examples/parquet_explicit_schema.yaml).
